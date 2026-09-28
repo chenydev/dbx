@@ -13,9 +13,12 @@ pub mod transport;
 
 pub use backend::{ConnectionSummary, DbxBackend, LocalBackend, WebBackend};
 pub use dbx_core::mongo_shell as mongo;
-pub use http::{serve_streamable_http_on_listener, serve_streamable_http_with_shutdown, streamable_http_router};
-pub use http_auth::HttpAuth;
+pub use http::{
+    serve_streamable_http_on_listener, serve_streamable_http_with_shutdown, streamable_http_router,
+    streamable_http_router_with_backend_factory, BackendFactory,
+};
+pub use http_auth::{current_principal, HttpAuth, McpKeyResolver, McpPrincipal, McpPrincipalKind};
 pub use runtime::{HttpRuntimeConfig, McpTransport, RuntimeConfig};
-pub use server::{DbxMcpServer, McpScope};
+pub use server::{builtin_tool_names, DbxMcpServer, McpScope};
 pub use session::McpSessionStore;
 pub use transport::with_legacy_discovery_fallback;

@@ -108,7 +108,7 @@ fn web_mcp_status_response(status: WebMcpHttpStatus) -> impl IntoResponse {
     ([(header::CACHE_CONTROL, "no-store")], Json(status))
 }
 
-async fn ensure_web_mcp_management_allowed(state: &WebState, headers: &HeaderMap) -> Result<(), AppError> {
+pub(crate) async fn ensure_web_mcp_management_allowed(state: &WebState, headers: &HeaderMap) -> Result<(), AppError> {
     if state.demo_mode || state.password_disabled || state.password_hash.read().await.is_none() {
         return Err(AppError::forbidden("Web MCP management requires password-protected DBX Web"));
     }

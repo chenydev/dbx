@@ -13,7 +13,7 @@ use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
 use crate::{
     diagnostics::health,
-    http_auth::{authorize_request, HttpAuth},
+    http_auth::{authorize_request, current_principal, HttpAuth, McpPrincipal},
     runtime::HttpRuntimeConfig,
     DbxBackend, DbxMcpServer, McpScope,
 };
@@ -28,11 +28,34 @@ pub fn streamable_http_router(
     allowed_hosts: Vec<String>,
     web_mode: bool,
 ) -> Result<Router, String> {
-    build_streamable_http_router(backend, path, auth, allowed_hosts, web_mode, None, Default::default())
+    build_streamable_http_router(shared_backend(backend), path, auth, allowed_hosts, web_mode, None, Default::default())
+}
+
+/// Picks the backend for a new MCP session from the authenticated principal.
+/// Returning an error rejects the session instead of falling back to a
+/// broader backend.
+pub type BackendFactory =
+    Arc<dyn Fn(Option<&McpPrincipal>) -> Result<Arc<dyn DbxBackend>, String> + Send + Sync>;
+
+/// Variant of [`streamable_http_router`] whose sessions receive a backend
+/// chosen per authenticated principal (for example, API keys scoped to a
+/// subset of connections).
+pub fn streamable_http_router_with_backend_factory(
+    factory: BackendFactory,
+    path: &str,
+    auth: HttpAuth,
+    allowed_hosts: Vec<String>,
+    web_mode: bool,
+) -> Result<Router, String> {
+    build_streamable_http_router(factory, path, auth, allowed_hosts, web_mode, None, Default::default())
+}
+
+fn shared_backend(backend: Arc<dyn DbxBackend>) -> BackendFactory {
+    Arc::new(move |_| Ok(backend.clone()))
 }
 
 fn build_streamable_http_router(
-    backend: Arc<dyn DbxBackend>,
+    factory: BackendFactory,
     path: &str,
     auth: HttpAuth,
     allowed_hosts: Vec<String>,
@@ -51,10 +74,12 @@ fn build_streamable_http_router(
     if let Some(cancellation) = cancellation {
         rmcp_config = rmcp_config.with_cancellation_token(cancellation);
     }
-    let server_backend = backend.clone();
     let scope = McpScope::from_env();
     let service: StreamableHttpService<DbxMcpServer, LocalSessionManager> = StreamableHttpService::new(
-        move || Ok(DbxMcpServer::with_runtime_options(server_backend.clone(), scope.clone(), web_mode)),
+        move || {
+            let backend = factory(current_principal().as_ref()).map_err(io::Error::other)?;
+            Ok(DbxMcpServer::with_runtime_options(backend, scope.clone(), web_mode))
+        },
         session_manager,
         rmcp_config,
     );
@@ -111,7 +136,7 @@ pub async fn serve_streamable_http_on_listener(
 ) -> io::Result<()> {
     let session_manager = Arc::new(LocalSessionManager::default());
     let mcp_router = build_streamable_http_router(
-        backend,
+        shared_backend(backend),
         &config.path,
         config.auth,
         config.allowed_hosts,
@@ -323,7 +348,7 @@ mod tests {
         let manager = Arc::new(local_manager);
         let cancellation = CancellationToken::new();
         let router = build_streamable_http_router(
-            backend,
+            shared_backend(backend),
             "/mcp",
             HttpAuth::new("http-test-token".to_string(), Vec::<String>::new(), true).unwrap(),
             vec![address.to_string()],
@@ -524,5 +549,97 @@ mod tests {
         server_task.await.unwrap();
         wait_for_disposal(&backend).await;
         drop(client);
+    }
+
+    struct StaticKeys;
+
+    impl crate::http_auth::McpKeyResolver for StaticKeys {
+        fn resolve(&self, token: &str) -> Option<McpPrincipal> {
+            ["key-a", "key-b"].contains(&token).then(|| McpPrincipal {
+                id: token.to_string(),
+                label: token.to_string(),
+                kind: crate::http_auth::McpPrincipalKind::ApiKey,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn api_keys_get_principal_scoped_sessions_that_other_keys_cannot_use() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let factory_seen = seen.clone();
+        let backend: Arc<dyn DbxBackend> = Arc::new(HttpTestBackend::new());
+        let factory: BackendFactory = Arc::new(move |principal| {
+            let principal = principal.ok_or_else(|| "missing principal".to_string())?;
+            factory_seen.lock().unwrap().push(principal.id.clone());
+            Ok(backend.clone())
+        });
+        let auth = HttpAuth::new("master-token".to_string(), Vec::<String>::new(), true).unwrap();
+        auth.set_key_resolver(Some(Arc::new(StaticKeys)));
+        let cancellation = CancellationToken::new();
+        let router = build_streamable_http_router(
+            factory,
+            "/mcp",
+            auth,
+            vec![address.to_string()],
+            false,
+            Some(cancellation.child_token()),
+            Default::default(),
+        )
+        .unwrap();
+        let shutdown = cancellation.clone();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, router).with_graceful_shutdown(async move { shutdown.cancelled().await }).await.unwrap();
+        });
+        let url = format!("http://{address}/mcp");
+
+        let unknown = reqwest::Client::new()
+            .post(&url)
+            .bearer_auth("key-c")
+            .header("accept", "application/json, text/event-stream")
+            .json(&json!({"jsonrpc": "2.0", "id": 1, "method": "ping"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unknown.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+        let initialize = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "1"}}
+        });
+        let created = reqwest::Client::new()
+            .post(&url)
+            .bearer_auth("key-a")
+            .header("accept", "application/json, text/event-stream")
+            .json(&initialize)
+            .send()
+            .await
+            .unwrap();
+        assert!(created.status().is_success(), "initialize returned {}", created.status());
+        let session_id = created.headers().get("mcp-session-id").unwrap().to_str().unwrap().to_string();
+        assert_eq!(seen.lock().unwrap().as_slice(), ["key-a"]);
+
+        let hijack = reqwest::Client::new()
+            .delete(&url)
+            .bearer_auth("key-b")
+            .header("mcp-session-id", &session_id)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(hijack.status(), reqwest::StatusCode::NOT_FOUND);
+
+        let owner = reqwest::Client::new()
+            .delete(&url)
+            .bearer_auth("key-a")
+            .header("mcp-session-id", &session_id)
+            .send()
+            .await
+            .unwrap();
+        assert!(owner.status().is_success(), "owner DELETE returned {}", owner.status());
+
+        cancellation.cancel();
+        task.await.unwrap();
     }
 }

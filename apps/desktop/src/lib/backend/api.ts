@@ -938,6 +938,14 @@ export const rotateMcpHttpServerToken = forward("rotateMcpHttpServerToken");
 export const loadWebMcpHttpStatus = forward("loadWebMcpHttpStatus");
 export const saveWebMcpHttpSettings = forward("saveWebMcpHttpSettings");
 export const rotateWebMcpToken = forward("rotateWebMcpToken");
+export const loadMcpAccessOverview = forward("loadMcpAccessOverview");
+export const createMcpTeam = forward("createMcpTeam");
+export const updateMcpTeam = forward("updateMcpTeam");
+export const deleteMcpTeam = forward("deleteMcpTeam");
+export const createMcpApiKey = forward("createMcpApiKey");
+export const updateMcpApiKey = forward("updateMcpApiKey");
+export const rotateMcpApiKey = forward("rotateMcpApiKey");
+export const deleteMcpApiKey = forward("deleteMcpApiKey");
 export const checkForUpdates = forward("checkForUpdates");
 export const fetchChangelog = forward("fetchChangelog");
 export const getSystemProxyUrl = forward("getSystemProxyUrl");
@@ -1008,6 +1016,13 @@ export type {
   McpHttpServerStatus,
   WebMcpHttpStatus,
   WebMcpHttpSettings,
+  McpTeam,
+  McpTeamAccess,
+  McpTeamInput,
+  McpApiKey,
+  McpApiKeyInput,
+  McpIssuedApiKey,
+  McpAccessOverview,
   UpdateInfo,
   DownloadedUpdate,
   RedisBlob,

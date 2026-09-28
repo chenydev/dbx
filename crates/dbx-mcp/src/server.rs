@@ -726,6 +726,12 @@ impl McpScope {
     }
 }
 
+/// Names of every built-in MCP tool before runtime route disabling. Hosts use
+/// this to derive explicit tool allowlists that stay complete as tools are added.
+pub fn builtin_tool_names() -> Vec<String> {
+    DbxMcpServer::tool_router().list_all().into_iter().map(|tool| tool.name.to_string()).collect()
+}
+
 impl DbxMcpServer {
     pub fn new(backend: Arc<dyn DbxBackend>) -> Self {
         Self::with_runtime_options(backend, McpScope::from_env(), std::env::var_os("DBX_WEB_URL").is_some())

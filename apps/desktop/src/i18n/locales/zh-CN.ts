@@ -4,6 +4,7 @@ import docs from "./docs/zh-CN";
 import { dataDictionaryZhCN as dataDictionary } from "./dataDictionaryMessages";
 import { consul } from "./consulZhCN";
 import { meilisearchManagementZhCN } from "./meilisearchManagement";
+import { mcpAccessZhCN } from "./mcpAccessKeys";
 import { mongodbDatabaseDumpZhCN as mongoDump } from "./mongodbDatabaseDump";
 
 export default withEnglishFallback({
@@ -6292,6 +6293,7 @@ export default withEnglishFallback({
       partialFailure: "MongoDB Legacy 驱动拒绝了 {total} 个文档中的 {failed} 个：{message}",
     },
   },
+  mcpAccess: mcpAccessZhCN,
   meilisearch: {
     ...meilisearchManagementZhCN,
     documents: "文档",

@@ -1,7 +1,8 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     net::Ipv6Addr,
-    sync::{Arc, RwLock},
+    sync::{Arc, Mutex, RwLock},
+    time::{Duration, Instant},
 };
 
 use axum::{
@@ -12,11 +13,90 @@ use axum::{
 };
 use url::Url;
 
+/// Authenticated caller of the HTTP endpoint. The shared bearer token maps to
+/// `Master`; hosts that install an [`McpKeyResolver`] may map additional API
+/// keys to their own principals and scope the backend per principal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct McpPrincipal {
+    /// Stable identifier used for session binding and backend scoping.
+    pub id: String,
+    /// Human-readable label for audit logs. Never contains secret material.
+    pub label: String,
+    pub kind: McpPrincipalKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum McpPrincipalKind {
+    Master,
+    ApiKey,
+}
+
+impl McpPrincipal {
+    pub fn master() -> Self {
+        Self { id: "master".to_string(), label: "master-token".to_string(), kind: McpPrincipalKind::Master }
+    }
+}
+
+/// Resolves bearer tokens other than the shared master token. Implementations
+/// must be cheap and non-blocking: they run inside the request middleware.
+pub trait McpKeyResolver: Send + Sync {
+    fn resolve(&self, token: &str) -> Option<McpPrincipal>;
+}
+
+tokio::task_local! {
+    static CURRENT_PRINCIPAL: McpPrincipal;
+}
+
+/// Principal of the HTTP request currently being served. rmcp creates the
+/// per-session server synchronously inside the request future, so session
+/// factories can use this to pick a principal-scoped backend.
+pub fn current_principal() -> Option<McpPrincipal> {
+    CURRENT_PRINCIPAL.try_with(Clone::clone).ok()
+}
+
+const SESSION_HEADER: &str = "mcp-session-id";
+const SESSION_BINDING_IDLE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+const SESSION_BINDING_CAPACITY: usize = 10_000;
+
+/// MCP session id -> owning principal id. Only enforced while a key resolver
+/// is installed, so one API key can never drive another key's session.
+#[derive(Default)]
+struct SessionBindings {
+    owners: HashMap<String, (String, Instant)>,
+}
+
+impl SessionBindings {
+    fn owner(&mut self, session_id: &str) -> Option<String> {
+        let entry = self.owners.get_mut(session_id)?;
+        entry.1 = Instant::now();
+        Some(entry.0.clone())
+    }
+
+    fn bind(&mut self, session_id: String, principal_id: String) {
+        let now = Instant::now();
+        self.owners.retain(|_, (_, seen)| now.duration_since(*seen) < SESSION_BINDING_IDLE_TTL);
+        if self.owners.len() >= SESSION_BINDING_CAPACITY {
+            if let Some(oldest) =
+                self.owners.iter().min_by_key(|(_, (_, seen))| *seen).map(|(session_id, _)| session_id.clone())
+            {
+                self.owners.remove(&oldest);
+            }
+        }
+        self.owners.insert(session_id, (principal_id, now));
+    }
+
+    fn unbind(&mut self, session_id: &str) {
+        self.owners.remove(session_id);
+    }
+}
+
 /// Authentication and browser-origin policy for the Streamable HTTP endpoint.
 /// The token is intentionally not `Debug` and is never exposed by diagnostics.
 #[derive(Clone)]
 pub struct HttpAuth {
     config: Arc<RwLock<HttpAuthConfig>>,
+    key_resolver: Arc<RwLock<Option<Arc<dyn McpKeyResolver>>>>,
+    sessions: Arc<Mutex<SessionBindings>>,
 }
 
 #[derive(Clone)]
@@ -54,7 +134,22 @@ impl HttpAuth {
             allowed_origins: normalize_origins(allowed_origins)?,
             allow_loopback_origins,
         };
-        Ok(Self { config: Arc::new(RwLock::new(config)) })
+        Ok(Self {
+            config: Arc::new(RwLock::new(config)),
+            key_resolver: Arc::new(RwLock::new(None)),
+            sessions: Arc::new(Mutex::new(SessionBindings::default())),
+        })
+    }
+
+    /// Installs (or removes) the resolver for additional API keys. The shared
+    /// master token keeps working either way; API keys are only accepted while
+    /// the endpoint itself is enabled by a master token.
+    pub fn set_key_resolver(&self, resolver: Option<Arc<dyn McpKeyResolver>>) {
+        *self.key_resolver.write().unwrap_or_else(|error| error.into_inner()) = resolver;
+    }
+
+    fn resolver(&self) -> Option<Arc<dyn McpKeyResolver>> {
+        self.key_resolver.read().unwrap_or_else(|error| error.into_inner()).clone()
     }
 
     /// Replaces the live bearer token and request-origin/host policy. The
@@ -147,7 +242,7 @@ fn host_is_allowed(config: &HttpAuthConfig, uri: &Uri, headers: &axum::http::Hea
 pub async fn authorize_request(State(auth): State<HttpAuth>, request: Request, next: Next) -> Response {
     let method = request.method().clone();
     let path = request.uri().path().to_string();
-    {
+    let principal = {
         let config = auth.config.read().unwrap_or_else(|error| error.into_inner());
         if config.token.is_none() {
             log::warn!(target: "dbx_mcp::audit", "MCP HTTP request rejected: method={method} path={path} reason=server-disabled");
@@ -177,14 +272,60 @@ pub async fn authorize_request(State(auth): State<HttpAuth>, request: Request, n
             log::warn!(target: "dbx_mcp::audit", "MCP HTTP request rejected: method={method} path={path} reason=missing-bearer-token");
             return unauthorized();
         };
-        if !token_matches(&config, token) {
-            log::warn!(target: "dbx_mcp::audit", "MCP HTTP request rejected: method={method} path={path} reason=invalid-bearer-token");
-            return unauthorized();
+        if token_matches(&config, token) {
+            Some(McpPrincipal::master())
+        } else {
+            None
+        }
+    };
+    let resolver = auth.resolver();
+    let principal = match principal {
+        Some(principal) => principal,
+        None => {
+            let resolved = bearer_token(request.headers().get(header::AUTHORIZATION))
+                .and_then(|token| resolver.as_ref().and_then(|resolver| resolver.resolve(token)));
+            let Some(principal) = resolved else {
+                log::warn!(target: "dbx_mcp::audit", "MCP HTTP request rejected: method={method} path={path} reason=invalid-bearer-token");
+                return unauthorized();
+            };
+            principal
+        }
+    };
+    let label = principal.label.clone();
+
+    let session_id =
+        request.headers().get(SESSION_HEADER).and_then(|value| value.to_str().ok()).map(ToOwned::to_owned);
+    let enforce_sessions = resolver.is_some();
+    if enforce_sessions {
+        if let Some(session_id) = session_id.as_deref() {
+            let owner = auth.sessions.lock().unwrap_or_else(|error| error.into_inner()).owner(session_id);
+            if owner.as_deref() != Some(principal.id.as_str()) {
+                log::warn!(target: "dbx_mcp::audit", "MCP HTTP request rejected: method={method} path={path} principal={label} reason=session-not-owned");
+                return not_found();
+            }
         }
     }
 
-    let response = next.run(request).await;
-    log::info!(target: "dbx_mcp::audit", "MCP HTTP request authenticated: method={method} path={path} status={}", response.status());
+    let mut request = request;
+    request.extensions_mut().insert(principal.clone());
+    let principal_id = principal.id.clone();
+    let response = CURRENT_PRINCIPAL.scope(principal, next.run(request)).await;
+
+    if enforce_sessions {
+        let mut sessions = auth.sessions.lock().unwrap_or_else(|error| error.into_inner());
+        match session_id {
+            None => {
+                if let Some(created) = response.headers().get(SESSION_HEADER).and_then(|value| value.to_str().ok()) {
+                    sessions.bind(created.to_string(), principal_id);
+                }
+            }
+            Some(session_id) if method == axum::http::Method::DELETE && response.status().is_success() => {
+                sessions.unbind(&session_id);
+            }
+            Some(_) => {}
+        }
+    }
+    log::info!(target: "dbx_mcp::audit", "MCP HTTP request authenticated: method={method} path={path} principal={label} status={}", response.status());
     response
 }
 

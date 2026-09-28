@@ -49,6 +49,7 @@ pub struct WebState {
     pub ssh_prompts: Arc<crate::ssh_prompt::SshPromptHub>,
     pub migration_ready: Arc<AtomicBool>,
     pub web_mcp: Arc<crate::web_mcp::WebMcpRuntime>,
+    pub mcp_access: Arc<crate::mcp_access::McpAccessStore>,
 }
 
 impl WebState {
@@ -59,6 +60,7 @@ impl WebState {
     /// Test helper: full field set so new WebState fields don't break scattered test fixtures.
     #[cfg(test)]
     pub fn for_tests(app: Arc<AppState>, data_dir: PathBuf) -> Self {
+        let mcp_access = Arc::new(crate::mcp_access::McpAccessStore::new(app.storage.clone(), Default::default()));
         Self {
             app,
             data_dir,
@@ -78,6 +80,7 @@ impl WebState {
             ssh_prompts: Arc::new(crate::ssh_prompt::SshPromptHub::new()),
             migration_ready: Arc::new(AtomicBool::new(true)),
             web_mcp: Arc::new(crate::web_mcp::WebMcpRuntime::disabled()),
+            mcp_access,
         }
     }
 }

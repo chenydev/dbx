@@ -830,6 +830,96 @@ export interface WebMcpHttpSettings {
   allowedOrigins: string[];
 }
 
+export type McpTeamAccess = "readOnly" | "readWrite" | "readWriteDangerous";
+
+export interface McpTeam {
+  id: string;
+  name: string;
+  description: string;
+  connectionIds: string[];
+  groupIds: string[];
+  access: McpTeamAccess;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface McpTeamInput {
+  name: string;
+  description: string;
+  connectionIds: string[];
+  groupIds: string[];
+  access: McpTeamAccess;
+}
+
+export interface McpApiKey {
+  id: string;
+  name: string;
+  prefix: string;
+  teamIds: string[];
+  enabled: boolean;
+  expired: boolean;
+  expiresAt: number | null;
+  createdAt: number;
+  updatedAt: number;
+  lastUsedAt: number | null;
+}
+
+export interface McpApiKeyInput {
+  name: string;
+  teamIds: string[];
+  enabled: boolean;
+  expiresAt: number | null;
+}
+
+export interface McpIssuedApiKey {
+  key: McpApiKey;
+  /** Plain-text key, returned only once by create and rotate. */
+  secret: string;
+}
+
+export interface McpAccessOverview {
+  endpointEnabled: boolean;
+  endpointPath: string;
+  teams: McpTeam[];
+  keys: McpApiKey[];
+  connections: { id: string; name: string; dbType: string; groupPath: string[] }[];
+  groups: { id: string; name: string }[];
+}
+
+const WEB_ONLY_MCP_ACCESS = "MCP API keys are available only in DBX Web";
+
+export async function loadMcpAccessOverview(): Promise<McpAccessOverview> {
+  throw new Error(WEB_ONLY_MCP_ACCESS);
+}
+
+export async function createMcpTeam(_input: McpTeamInput): Promise<McpTeam> {
+  throw new Error(WEB_ONLY_MCP_ACCESS);
+}
+
+export async function updateMcpTeam(_id: string, _input: McpTeamInput): Promise<McpTeam> {
+  throw new Error(WEB_ONLY_MCP_ACCESS);
+}
+
+export async function deleteMcpTeam(_id: string): Promise<void> {
+  throw new Error(WEB_ONLY_MCP_ACCESS);
+}
+
+export async function createMcpApiKey(_input: McpApiKeyInput): Promise<McpIssuedApiKey> {
+  throw new Error(WEB_ONLY_MCP_ACCESS);
+}
+
+export async function updateMcpApiKey(_id: string, _input: McpApiKeyInput): Promise<McpApiKey> {
+  throw new Error(WEB_ONLY_MCP_ACCESS);
+}
+
+export async function rotateMcpApiKey(_id: string): Promise<McpIssuedApiKey> {
+  throw new Error(WEB_ONLY_MCP_ACCESS);
+}
+
+export async function deleteMcpApiKey(_id: string): Promise<void> {
+  throw new Error(WEB_ONLY_MCP_ACCESS);
+}
+
 export async function loadMcpHttpServerSettings(): Promise<McpHttpServerSettings> {
   return invoke("load_mcp_http_server_settings");
 }

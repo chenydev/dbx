@@ -4,6 +4,7 @@ import { dataDictionaryEn as dataDictionary } from "./dataDictionaryMessages";
 import { consulUiMessages } from "./consulUi";
 import { sqlServerTraceMessages as sqlServerTrace } from "./sqlServerTraceMessages";
 import { meilisearchManagementEn } from "./meilisearchManagement";
+import { mcpAccessEn } from "./mcpAccessKeys";
 import { mongodbDatabaseDumpEn as mongoDump } from "./mongodbDatabaseDump";
 
 const consul = {
@@ -6319,6 +6320,7 @@ export default {
       partialFailure: "The MongoDB Legacy driver rejected {failed} of {total} documents: {message}",
     },
   },
+  mcpAccess: mcpAccessEn,
   meilisearch: {
     ...meilisearchManagementEn,
     documents: "Documents",

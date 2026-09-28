@@ -245,6 +245,7 @@ import AiProviderLogo from "@/components/icons/AiProviderLogo.vue";
 import AppLogo from "@/components/icons/AppLogo.vue";
 import ChangelogPanel from "@/components/settings/ChangelogPanel.vue";
 import SettingsTransferPanel from "@/components/settings/SettingsTransferPanel.vue";
+import WebMcpAccessKeysSettings from "@/components/settings/WebMcpAccessKeysSettings.vue";
 import McpResourceScopePicker from "@/components/settings/McpResourceScopePicker.vue";
 import McpDatabaseScopePicker from "@/components/settings/McpDatabaseScopePicker.vue";
 import McpAuthorizationStepper from "@/components/settings/McpAuthorizationStepper.vue";
@@ -2999,6 +3000,7 @@ const settingsCategoryNav = computed<{ value: SettingsCategory; label: string }[
   { value: "sync", label: t("settings.syncTab") },
   { value: "ai", label: t("settings.aiTab") },
   { value: "mcp" as const, label: t("settings.mcpTab") },
+  ...(isWeb ? [{ value: "mcpKeys" as const, label: t("mcpAccess.tab") }] : []),
   { value: "updates" as const, label: t("settings.updatesTab") },
   ...(isWeb ? [{ value: "security" as const, label: t("settings.securityTab") }] : []),
   { value: "about", label: t("settings.aboutTab") },
@@ -10702,6 +10704,10 @@ LIMIT 100;</pre
                 </Select>
               </div>
               <ChangelogPanel :checking-updates="props.checkingUpdates" @check-updates="emit('check-updates')" />
+            </section>
+
+            <section v-else-if="activeSettingsTab === 'mcpKeys' && isWeb" data-settings-search-id="mcp-keys" :class="settingsSearchTargetClass('mcp-keys')">
+              <WebMcpAccessKeysSettings />
             </section>
 
             <section v-else-if="activeSettingsTab === 'security' && isWeb" data-settings-search-id="security" :class="['flex flex-col gap-5 py-2', settingsSearchTargetClass('security')]">

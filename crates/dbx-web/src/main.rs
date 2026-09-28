@@ -1,6 +1,7 @@
 mod auth;
 mod demo;
 mod error;
+mod mcp_access;
 mod routes;
 mod sse;
 mod ssh_prompt;
@@ -25,7 +26,7 @@ use dbx_core::persistence::secret_codec::SecretKeyPolicy;
 use dbx_core::sql_dialect::dialect_loader::{register_core_dialects, DialectPluginLoader, DialectRegistry};
 use dbx_core::sql_dialect::hot_reload::DialectHotReload;
 use dbx_core::storage::Storage;
-use dbx_mcp::{streamable_http_router, DbxBackend, LocalBackend};
+use dbx_mcp::{streamable_http_router_with_backend_factory, DbxBackend, LocalBackend, McpPrincipalKind};
 use state::WebState;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::RwLock;
@@ -288,12 +289,29 @@ fn mount_static_assets(mut app: Router, public_base_path: &str, source: Option<S
 /// feature is disabled so an authenticated settings action can enable it
 /// without restarting the Web process; the shared auth middleware returns 404
 /// until a token is configured.
+///
+/// The master token gets the unscoped local backend; API keys get a backend
+/// narrowed to their teams (see `mcp_access`). Sessions without an
+/// authenticated principal are rejected rather than falling back.
 fn web_mcp_router(web_state: &Arc<WebState>) -> Result<Router, String> {
     let auth = web_state.web_mcp.auth();
+    auth.set_key_resolver(Some(web_state.mcp_access.clone()));
     let backend: Arc<dyn DbxBackend> =
         Arc::new(LocalBackend::from_app_state(web_state.app.clone(), web_state.data_dir.clone()));
+    let store = web_state.mcp_access.clone();
+    let builtin_tools = Arc::new(dbx_mcp::builtin_tool_names());
+    let factory: dbx_mcp::BackendFactory = Arc::new(move |principal| match principal {
+        Some(principal) if principal.kind == McpPrincipalKind::Master => Ok(backend.clone()),
+        Some(principal) => Ok(Arc::new(mcp_access::backend::KeyScopedBackend::new(
+            backend.clone(),
+            store.clone(),
+            principal.id.clone(),
+            builtin_tools.clone(),
+        )) as Arc<dyn DbxBackend>),
+        None => Err("MCP session has no authenticated principal".to_string()),
+    });
 
-    streamable_http_router(backend, "/mcp", auth, web_state.web_mcp.allowed_hosts(), true)
+    streamable_http_router_with_backend_factory(factory, "/mcp", auth, web_state.web_mcp.allowed_hosts(), true)
 }
 
 #[cfg(feature = "mq-admin")]
@@ -465,7 +483,11 @@ async fn serve() {
     } else {
         WebMcpRuntime::disabled()
     });
+    let mcp_access = Arc::new(
+        mcp_access::McpAccessStore::load(app_state.storage.clone()).await.expect("Invalid DBX Web MCP access keys"),
+    );
     let web_state = Arc::new(WebState {
+        mcp_access,
         app: app_state,
         data_dir,
         public_base_path: public_base_path.clone(),
@@ -487,6 +509,18 @@ async fn serve() {
     });
 
     ssh_prompt::install_web_ssh_prompt_bridge(web_state.ssh_prompts.clone());
+    {
+        let store = web_state.mcp_access.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                if let Err(error) = store.flush_usage().await {
+                    tracing::warn!("Failed to persist MCP API key usage: {error}");
+                }
+            }
+        });
+    }
     routes::sql_file::start_sql_file_cleanup(&web_state);
 
     let backup_root = std::env::var_os("DBX_BACKUP_ROOT")
@@ -1297,6 +1331,12 @@ async fn serve() {
         .route("/app-settings/mcp-http-status", get(routes::app_settings::load_web_mcp_http_status))
         .route("/app-settings/mcp-http", put(routes::app_settings::save_web_mcp_http_settings))
         .route("/app-settings/mcp-http/rotate-token", post(routes::app_settings::rotate_web_mcp_token))
+        .route("/mcp-access/overview", get(routes::mcp_access::overview))
+        .route("/mcp-access/teams", post(routes::mcp_access::create_team))
+        .route("/mcp-access/teams/{id}", put(routes::mcp_access::update_team).delete(routes::mcp_access::delete_team))
+        .route("/mcp-access/keys", post(routes::mcp_access::create_key))
+        .route("/mcp-access/keys/{id}", put(routes::mcp_access::update_key).delete(routes::mcp_access::delete_key))
+        .route("/mcp-access/keys/{id}/rotate", post(routes::mcp_access::rotate_key))
         .route(
             "/app-settings/max-agent-turns",
             get(routes::app_settings::load_max_agent_turns).put(routes::app_settings::save_max_agent_turns),

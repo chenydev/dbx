@@ -24,6 +24,7 @@ embed-static = ["dep:rust-embed", "dep:mime_guess"]
 dbx-core = { path = "../dbx-core", default-features = false, features = ["openapi"] }
 dbx-mcp = { path = "../dbx-mcp", default-features = false }
 redis = { version = "0.32", features = ["tokio-comp"] }
+async-trait = "0.1"
 axum = { version = "0.8", features = ["multipart", "ws"] }
 tower-http = { version = "0.6", features = ["cors", "fs", "compression-gzip", "trace"] }
 tokio = { version = "1", features = ["full"] }

@@ -1603,8 +1603,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("dbx-web-mq-policy-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let storage = dbx_core::persistence::test_storage::open(&dir.join("storage.db")).await.unwrap();
+        let mcp_access = Arc::new(crate::mcp_access::McpAccessStore::new(storage.clone(), Default::default()));
         let app = Arc::new(AppState::new_with_plugin_dir(storage, dir.join("plugins")));
         let state = Arc::new(WebState {
+            mcp_access,
             app,
             data_dir: dir.clone(),
             public_base_path: "/".to_string(),

@@ -2238,6 +2238,53 @@ export async function rotateWebMcpToken(): Promise<import("@/lib/backend/tauri")
   return res.json();
 }
 
+type McpAccessTypes = typeof import("@/lib/backend/tauri");
+
+async function mcpAccessRequest<T>(method: string, path: string, body?: unknown): Promise<T> {
+  const headers: Record<string, string> = { "X-DBX-MCP-Settings": "1" };
+  if (body !== undefined) headers["Content-Type"] = "application/json";
+  const res = await fetch(apiUrl(`/api/mcp-access${path}`), {
+    method,
+    headers,
+    cache: "no-store",
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  if (!res.ok) throw await backendResponseError(res);
+  return res.status === 204 ? (undefined as T) : res.json();
+}
+
+export async function loadMcpAccessOverview(): ReturnType<McpAccessTypes["loadMcpAccessOverview"]> {
+  return mcpAccessRequest("GET", "/overview");
+}
+
+export async function createMcpTeam(input: import("@/lib/backend/tauri").McpTeamInput): ReturnType<McpAccessTypes["createMcpTeam"]> {
+  return mcpAccessRequest("POST", "/teams", input);
+}
+
+export async function updateMcpTeam(id: string, input: import("@/lib/backend/tauri").McpTeamInput): ReturnType<McpAccessTypes["updateMcpTeam"]> {
+  return mcpAccessRequest("PUT", `/teams/${encodeURIComponent(id)}`, input);
+}
+
+export async function deleteMcpTeam(id: string): Promise<void> {
+  return mcpAccessRequest("DELETE", `/teams/${encodeURIComponent(id)}`);
+}
+
+export async function createMcpApiKey(input: import("@/lib/backend/tauri").McpApiKeyInput): ReturnType<McpAccessTypes["createMcpApiKey"]> {
+  return mcpAccessRequest("POST", "/keys", input);
+}
+
+export async function updateMcpApiKey(id: string, input: import("@/lib/backend/tauri").McpApiKeyInput): ReturnType<McpAccessTypes["updateMcpApiKey"]> {
+  return mcpAccessRequest("PUT", `/keys/${encodeURIComponent(id)}`, input);
+}
+
+export async function rotateMcpApiKey(id: string): ReturnType<McpAccessTypes["rotateMcpApiKey"]> {
+  return mcpAccessRequest("POST", `/keys/${encodeURIComponent(id)}/rotate`);
+}
+
+export async function deleteMcpApiKey(id: string): Promise<void> {
+  return mcpAccessRequest("DELETE", `/keys/${encodeURIComponent(id)}`);
+}
+
 export async function loadMaxAgentTurns(): Promise<number> {
   return get("/api/app-settings/max-agent-turns");
 }

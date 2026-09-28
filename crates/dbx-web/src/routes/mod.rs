@@ -15,6 +15,7 @@ pub mod hbase;
 pub mod history;
 pub mod jdbc;
 pub mod layout;
+pub mod mcp_access;
 pub mod mcp_policy;
 pub mod migration;
 pub mod mongo;
