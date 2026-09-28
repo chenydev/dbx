@@ -21,6 +21,11 @@ RUN pnpm build
 # Stage 2: Cross-compile Rust backend for the requested platform (native, no emulation)
 FROM --platform=$BUILDPLATFORM rust:1-bookworm AS backend
 ARG TARGETARCH
+# Optional overrides for memory-constrained builders (e.g. 7 GB CI runners).
+# Unset build args are not exported, so the workspace release profile applies.
+ARG CARGO_PROFILE_RELEASE_LTO
+ARG CARGO_PROFILE_RELEASE_CODEGEN_UNITS
+ARG CARGO_BUILD_JOBS
 WORKDIR /app
 RUN dpkg --add-architecture arm64 \
     && apt-get update && apt-get install -y --no-install-recommends \
