@@ -103,7 +103,7 @@ import { consulAgentAddressesMatch } from "@/lib/consul/agentTarget";
 import { appendConnectionErrorHints, isJdbcMissingRuntimeDependencyError } from "@/lib/connection/connectionErrorHints";
 import { buildCassandraExternalConfig, cassandraTlsConfigFromExternalConfig, type CassandraTlsConfig } from "@/lib/connection/cassandraTlsOptions";
 import { savedMysqlTlsFormFields, supportsMysqlTlsOptions as mysqlTlsOptionsSupported, supportsMysqlTlsTab } from "@/lib/connection/mysqlTlsCapabilities";
-import { preventDialogDocumentSelectAll } from "@/lib/connection/dialogTextSelection";
+import { copyDialogPasswordFieldValue, preventDialogDocumentSelectAll } from "@/lib/connection/dialogTextSelection";
 import { postgresLegacyTlsEnabled, postgresTlsModeForForm, setPostgresLegacyTlsEnabled } from "@/lib/connection/postgresTlsMode";
 import { buildMqKafkaConnectionExtra, mqKafkaConnectionTarget, resolveMqKafkaConnectionSource, type MqKafkaConnectionSource } from "@/lib/connection/mqKafkaConnection";
 import { assertCompleteDatabaseCategories, databaseSelectionForCategory } from "@/lib/connection/databaseCategoryOptions";
@@ -2885,6 +2885,9 @@ function applyProfile(val: string, preserveConnectionFields = false) {
       jdbcDriverPathsInput.value = "";
       jdbcManualClasspathOpen.value = true;
     }
+    if (profile.type === "transwarp") {
+      form.value.connection_string = undefined;
+    }
     if (profile.type === "spanner") {
       // Google Cloud endpoints carry no host; the local emulator is opted into
       // by typing host `localhost` and port 9010 explicitly.
@@ -2940,7 +2943,7 @@ function applyProfile(val: string, preserveConnectionFields = false) {
     if (profile.type === "salesforce") {
       resetSalesforceOAuthFields(form.value.external_config, form.value.password);
     }
-    resetHiveKerberosFields(profile.type === "hive" || profile.type === "argo" || profile.type === "kyuubi" || profile.type === "impala" ? form.value : undefined);
+    resetHiveKerberosFields(profile.type === "hive" || profile.type === "argo" || profile.type === "transwarp" || profile.type === "kyuubi" || profile.type === "impala" ? form.value : undefined);
   }
   if (profile.type === "meilisearch") {
     syncMeilisearchHostInput(form.value);
@@ -3174,7 +3177,7 @@ watch(
         resetSalesforceOAuthFields(undefined, undefined);
       }
       resetElasticsearchProxyFields(config.db_type === "elasticsearch" ? config.external_config : undefined);
-      resetHiveKerberosFields(config.db_type === "hive" || config.db_type === "argo" || config.db_type === "kyuubi" || config.db_type === "impala" ? config : undefined);
+      resetHiveKerberosFields(config.db_type === "hive" || config.db_type === "argo" || config.db_type === "transwarp" || config.db_type === "kyuubi" || config.db_type === "impala" ? config : undefined);
       resetDamengJvmOptions(config.db_type === "dameng" ? config : undefined);
       h2ConnectionMode.value = h2ConnectionModeForConfig(config);
       customColorInput.value = config.color || "";
@@ -4696,7 +4699,7 @@ function connectionConfigForSubmit(id: string, generatedName = "", validatePlugi
     config.ssl = !!config.ssl || damengSsl.enabled;
     config.url_params = applyDamengSslUrlParams(config.url_params, config.ssl, damengSsl.sslFilesPath, damengSsl.sslKeystorePassword, damengSsl.sslProtocol);
   }
-  if (config.db_type === "hive" || config.db_type === "argo" || config.db_type === "kyuubi" || config.db_type === "impala") {
+  if (config.db_type === "hive" || config.db_type === "argo" || config.db_type === "transwarp" || config.db_type === "kyuubi" || config.db_type === "impala") {
     if (hiveAuthMode.value === "kerberos" && !hivePrincipal.value.trim()) {
       throw new Error(t("connection.hiveKerberosPrincipalRequired"));
     }
@@ -5090,6 +5093,10 @@ function connectionConfigForSubmit(id: string, generatedName = "", validatePlugi
     config.jdbc_driver_paths = parsedJdbcDriverPaths();
   } else if (config.db_type === "gaussdb") {
     config.connection_string = undefined;
+    config.jdbc_driver_class = undefined;
+    config.jdbc_driver_paths = [];
+  }
+  if (config.db_type === "transwarp") {
     config.jdbc_driver_class = undefined;
     config.jdbc_driver_paths = [];
   }
@@ -6825,7 +6832,16 @@ function openExternalUrl(url: string) {
 
 <template>
   <Dialog v-model:open="open">
-    <DialogContent :style="dialogContentStyle" class="connection-dialog-content" :class="connectionDialogContentClass" :data-wide="shouldUseWideConnectionDialog ? 'true' : undefined" @interact-outside.prevent @escape-key-down="handleDialogEscape" @keydown="preventDialogDocumentSelectAll">
+    <DialogContent
+      :style="dialogContentStyle"
+      class="connection-dialog-content"
+      :class="connectionDialogContentClass"
+      :data-wide="shouldUseWideConnectionDialog ? 'true' : undefined"
+      @interact-outside.prevent
+      @escape-key-down="handleDialogEscape"
+      @keydown="preventDialogDocumentSelectAll"
+      @copy="copyDialogPasswordFieldValue"
+    >
       <DialogHeader class="cursor-move select-none" @pointerdown="onDialogHeaderPointerDown" @pointermove="onDialogHeaderPointerMove" @pointerup="onDialogHeaderPointerEnd" @pointercancel="onDialogHeaderPointerEnd">
         <DialogTitle>{{ editingId ? t("connection.editTitle") : t("connection.title") }}</DialogTitle>
       </DialogHeader>
@@ -8880,7 +8896,7 @@ function openExternalUrl(url: string) {
                       <p class="col-span-3 text-xs text-muted-foreground">{{ t("connection.oracleTnsPathHint") }}</p>
                     </div>
 
-                    <template v-if="form.db_type === 'hive' || form.db_type === 'kyuubi' || form.db_type === 'impala'">
+                    <template v-if="form.db_type === 'hive' || form.db_type === 'transwarp' || form.db_type === 'kyuubi' || form.db_type === 'impala'">
                       <div class="grid grid-cols-4 items-center gap-4">
                         <Label :class="connectionLabelClass">{{ t("connection.hiveAuthMode") }}</Label>
                         <div class="col-span-3 grid h-8 grid-cols-2 overflow-hidden rounded-md border border-input bg-muted/30 p-0.5">
@@ -9023,7 +9039,9 @@ function openExternalUrl(url: string) {
                                             ? 'catalog=paimon_catalog'
                                             : form.db_type === 'cassandra'
                                               ? 'localdatacenter=dc1'
-                                              : 'sslmode=prefer'
+                                              : form.db_type === 'transwarp'
+                                                ? 'fetchSize=500;auth=noSasl'
+                                                : 'sslmode=prefer'
                           "
                         />
                         <p v-if="showGenericUrlParamsHint" class="text-xs leading-5 text-muted-foreground">

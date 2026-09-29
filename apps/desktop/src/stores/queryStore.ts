@@ -31,7 +31,18 @@ import { canCancelQueryExecution } from "@/lib/sql/queryExecutionState";
 import { isSqlErrorPositionDebugEnabled, logSqlErrorPosition, sqlErrorHasMessagePosition, sqlErrorMessageText } from "@/lib/sql/errorPosition";
 import { buildExplainSql, parseExplainResult, parseDamengExplainText, parseOracleExplainText, sqlServerExplainResult, type BuildExplainSqlResult, type ExplainPlanDatabaseType } from "@/lib/diagram/explainPlan";
 import { mysqlExplainCompatibilityHint } from "@/lib/diagram/mysqlExplainCompatibility";
-import { allEditableColumnsWriteable, allPrimaryKeysPresent, analyzeEditableQueryEditability, analyzeSelectStructureForDisplay, resolveMetadataColumnName, resolveSourceColumnsByOrdinal, sourceColumnsForResult, type EditableQueryInfo, type EditableQuerySource } from "@/lib/sql/sqlAnalysis";
+import {
+  allEditableColumnsWriteable,
+  allPrimaryKeysPresent,
+  analyzeEditableQueryEditability,
+  analyzeSelectStructureForDisplay,
+  foldUnquotedPostgresMetadataIdentifier,
+  resolveMetadataColumnName,
+  resolveSourceColumnsByOrdinal,
+  sourceColumnsForResult,
+  type EditableQueryInfo,
+  type EditableQuerySource,
+} from "@/lib/sql/sqlAnalysis";
 import { buildQueryWithHiddenPrimaryKeys, hiddenResultColumnIndexes, type HiddenPrimaryKeyProjection } from "@/lib/sql/editableQueryHiddenKeys";
 import { ACTIVE_TAB_STORAGE_KEY, OPEN_TABS_STORAGE_KEY, restoreOpenTabsPayload, restoreOpenTabsState, serializeOpenTabs, type OpenTabsStatePayload } from "@/lib/app/openTabsPersistence";
 import {
@@ -62,13 +73,14 @@ import { redisCommandResultToQueryResult } from "@/lib/redis/redisQueryResult";
 import { nextRedisCommandDb } from "@/lib/redis/redisCommandSession";
 import { isRedisMutatingCommand } from "@/lib/redis/redisCommandTable";
 import { formatRedisConsoleValue } from "@/lib/redis/redisValuePresentation";
-import { usesAgentCursorForQuery } from "@/lib/database/databaseDriverManifest";
+import { usesAgentCursorForQuery, usesAgentCursorForTableData } from "@/lib/database/databaseDriverManifest";
 import { connectionIsDorisFamilyCatalogCapable, defaultAutoCommitForDbType, supportsClearableQuerySchema, supportsTransaction, usesOracleStickyTransactionState, usesProvenReadOnlyStickyTransactionState } from "@/lib/database/databaseFeatureSupport";
 import { canInsertTableRows, canUseKeylessRowPredicate, DBX_ROWID_COLUMN, editablePrimaryKeys, shouldIncludeSyntheticRowId, usesSyntheticRowIdKey } from "@/lib/table/tableEditing";
 import { TABLE_DATA_EXPORT_PAGE_SIZE } from "@/lib/table/tableDataExport";
-import { tableMetaForDataTab } from "@/lib/table/tableDataTabMeta";
+import { repairRestoredDataTabTableIdentity, tableMetaForDataTab } from "@/lib/table/tableDataTabMeta";
 import { isDataTabMetadataLifecycleStale } from "@/lib/sidebar/dataTabOpenPolicy";
 import type { SqlInsertMode } from "@/lib/export/sqlInsertMode";
+import { csvNullLiteralForMode } from "@/lib/export/csvNullMode";
 import { tableOpenPageLimit } from "@/lib/table/tableOpenPageLimit";
 import { getCachedTableMetadata, loadTableColumns, loadTableIndexes, loadTableMetadata, tableMetadataToDataTabMeta, updateCachedTableMetadataType, type TableMetadataRequest } from "@/lib/metadata/tableMetadataCache";
 import { loadObjectDdl } from "@/lib/metadata/objectDdlCache";
@@ -115,7 +127,7 @@ import { createSavedSqlEditorPosition, initSavedSqlEditorPositions, restoreSaved
 import { isDetachedWindow, resolveWindowContext } from "@/lib/app/windowContext";
 import { normalizeDetachedTabRuntime, type DetachedTabHandoff, type DetachedTabRuntimeState } from "@/lib/app/detachedTabHandoff";
 import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
-import { resolveSavedSqlExecutionTarget, savedSqlExecutionTargetFromTab, type SavedSqlExecutionTarget, type SavedSqlOpenTargetMode } from "@/lib/savedSql/savedSqlExecutionTarget";
+import { resolveSavedSqlExecutionTarget, savedSqlExecutionTargetFromFile, savedSqlExecutionTargetFromTab, type SavedSqlExecutionTarget, type SavedSqlOpenTargetMode } from "@/lib/savedSql/savedSqlExecutionTarget";
 import { safeLocalStorageGet, safeLocalStorageRemove } from "@/lib/backend/safeStorage";
 import { sqlTextFingerprint } from "@/lib/sql/sqlTextFingerprint";
 import { loadEditableObjectSourceForEditor } from "@/lib/table/objectSourceLoad";
@@ -2425,6 +2437,7 @@ export const useQueryStore = defineStore("query", () => {
         tab.autoCommit = defaultAutoCommitForDbTypeWithSetting(connection?.db_type);
       } else if (tab.mode === "data" && connection) {
         tab.schema = connectionObjectTreeNodeSchema(connection, tab.database, tab.schema);
+        repairRestoredDataTabTableIdentity(tab, effectiveDatabaseTypeForConnection(connection));
       }
     }
     restored.tabs.forEach(initializeResultAutoSave);
@@ -3353,6 +3366,29 @@ export const useQueryStore = defineStore("query", () => {
       isCancelling: false,
       isExplaining: false,
       mode: "users",
+    };
+    return registerOpenTab(tab);
+  }
+
+  function openXuguUserAdmin(connectionId: string) {
+    const existing = tabs.value.find((tab) => tab.mode === "xugu-users" && tab.connectionId === connectionId);
+    if (existing) {
+      switchTab(existing.id);
+      return existing.id;
+    }
+
+    const conn = useConnectionStore().getConfig(connectionId);
+    const id = uuid();
+    const tab: QueryTab = {
+      id,
+      title: t("xuguUserPermissions.title"),
+      connectionId,
+      database: conn?.database || "",
+      sql: "",
+      isExecuting: false,
+      isCancelling: false,
+      isExplaining: false,
+      mode: "xugu-users",
     };
     return registerOpenTab(tab);
   }
@@ -4841,6 +4877,7 @@ export const useQueryStore = defineStore("query", () => {
       const sql = await buildTableSelectSql({
         databaseType: effectiveDbType,
         driverProfile: conn?.driver_profile,
+        serverVersion: conn?.database_info?.productVersion,
         identifierQuote,
         database: tableMeta.database,
         schema: tableMeta.schema,
@@ -5334,6 +5371,18 @@ export const useQueryStore = defineStore("query", () => {
       else updateDatabase(tab.id, target.database, options);
     }
     updateSchema(tab.id, target.schema, options);
+  }
+
+  function syncSavedSqlExecutionTargets(files: readonly SavedSqlFile[]) {
+    const targetsByFileId = new Map(files.map((file) => [file.id, savedSqlExecutionTargetFromFile(file)]));
+    let synchronized = 0;
+    for (const tab of tabs.value) {
+      const target = tab.savedSqlId ? targetsByFileId.get(tab.savedSqlId) : undefined;
+      if (!target) continue;
+      applySavedSqlExecutionTarget(tab, target);
+      synchronized++;
+    }
+    return synchronized;
   }
 
   function openSavedSql(file: SavedSqlFile, options: OpenSavedSqlOptions = {}) {
@@ -5881,7 +5930,13 @@ export const useQueryStore = defineStore("query", () => {
     // unqualified object reference. Resolve metadata through the login's
     // default schema (with the driver's dbo fallback) so metadata and writes
     // target the same object as the original SELECT.
-    const schema = source.schema || (dbType === "sqlserver" ? "" : tab.schema) || "";
+    // PostgreSQL-compatible engines resolve an unquoted identifier by folding
+    // it to lower case, so the query's original spelling is not addressable:
+    // quoting it (grid saves) fails with `relation ... does not exist`
+    // (issue #10567). Fold the SQL-text schema, not a tab-selected one — the
+    // object tree already reports the stored spelling.
+    const foldedSourceSchema = foldUnquotedPostgresMetadataIdentifier(metadataDbType, source.schema, source.schemaQuoted);
+    const schema = foldedSourceSchema || (dbType === "sqlserver" ? "" : tab.schema) || "";
     // Oracle-family connection databases are service names, not schemas. When
     // the query does not qualify a schema, let the driver resolve the current
     // login user's schema instead of looking up metadata under the service name.
@@ -5896,7 +5951,7 @@ export const useQueryStore = defineStore("query", () => {
     const useCurrentPostgresSchema = (dbType === "postgres" || dbType === "kwdb") && !source.schema && !tab.schema;
     const resolvedSchema = (dbType === "sqlserver" && !source.schema) || (ORACLE_LIKE_METADATA_TYPES.has(metadataDbType) && !schema) || resolveAgentSearchPathSchema || useCurrentPostgresSchema ? "" : metadataSchemaForConnection(conn, metadataDatabase, schema || undefined);
     const metadataSchema = normalizeUppercaseFoldedMetadataIdentifier(metadataDbType, resolvedSchema || undefined, source.schema ? source.schemaQuoted : false) || "";
-    const metadataTableName = normalizeUppercaseFoldedMetadataIdentifier(metadataDbType, source.tableName, source.tableNameQuoted)!;
+    const metadataTableName = normalizeUppercaseFoldedMetadataIdentifier(metadataDbType, foldUnquotedPostgresMetadataIdentifier(metadataDbType, source.tableName, source.tableNameQuoted)!, source.tableNameQuoted)!;
     // An unqualified source resolves in the tab's current external catalog on
     // Doris-family federation: the statement executed there through the
     // catalog execution context, so the column lookup must carry the same
@@ -6720,6 +6775,7 @@ export const useQueryStore = defineStore("query", () => {
     const traceId = executionId.slice(0, 8);
     const startedAt = performance.now();
     const executionTargetEpoch = manualTransactionTargetEpoch(tab);
+    const cancelRequestCountAtStart = tab.cancelRequestCount ?? 0;
     const elapsed = () => `${Math.round(performance.now() - startedAt)}ms`;
     const batchResume = options?.batchResume;
     const continueOnBatchError = batchResume?.continueOnError ?? settingsStore.editorSettings.continueOnErrorOnBatch;
@@ -7590,7 +7646,7 @@ export const useQueryStore = defineStore("query", () => {
         const pagination = limitQueryPagination(requestedPagination, queryResultMaxRows);
         pageLimit = pagination.limit;
         pageOffset = pagination.offset;
-        useAgentResultSession = conn?.db_type === "sqlserver" && conn?.driver_profile?.trim().toLowerCase() === "sqlserver-legacy";
+        useAgentResultSession = usesAgentCursorForTableData(conn?.db_type, conn?.driver_profile);
       }
 
       errorLocateContext = {
@@ -7658,7 +7714,7 @@ export const useQueryStore = defineStore("query", () => {
         });
         executionDispatched = true;
         if (tab.mode === "query") clientRequestStartedAt = performance.now();
-        if (useAgentResultSession && tab.mode === "query" && typeof pageOffset === "number" && pageOffset > 0 && !options?.pagination?.sessionId && !(tab.batchSqlExecution && tab.batchSqlExecution.total > 1)) {
+        if (useAgentResultSession && (tab.mode === "query" || tab.mode === "data") && typeof pageOffset === "number" && pageOffset > 0 && !options?.pagination?.sessionId && !(tab.batchSqlExecution && tab.batchSqlExecution.total > 1)) {
           return (async () => {
             let sessionId: string | undefined;
             let skipped = 0;
@@ -7666,35 +7722,50 @@ export const useQueryStore = defineStore("query", () => {
             let executionMs = 0;
             let completeTimings = true;
             const timings: Record<string, number> = {};
-            while (true) {
-              const pageResults = await api.executeMulti(executionConnectionId, executionDatabase, sqlToExecute, executionSchema, executionId, {
-                ...executionOptions,
-                resultSessionId: sessionId,
-              });
-              const page = pageResults[0];
-              if (!page) return pageResults;
-              pageCount += 1;
-              executionMs += page.execution_time_ms;
-              if (!page.query_timings_ms) completeTimings = false;
-              else for (const [key, value] of Object.entries(page.query_timings_ms)) timings[key] = (timings[key] ?? 0) + value;
-              // Offset jumps consume several cursor pages before publication.
-              // Keep their timings as well, without retaining skipped rows.
-              const timingSummary = { query_timings_ms: completeTimings ? { ...timings } : undefined, execution_time_ms: executionMs, timing_page_count: pageCount };
-              if (skipped + page.rows.length > pageOffset) {
-                const start = pageOffset - skipped;
-                const limit = typeof pageLimit === "number" ? pageLimit : page.rows.length - start;
-                return [{ ...page, ...timingSummary, rows: page.rows.slice(start, start + limit) }];
-              }
-              skipped += page.rows.length;
-              if (!page.has_more || !page.session_id) {
-                if (page.has_more) {
-                  // The cursor session ended before the requested offset;
-                  // returning the short page would show the wrong rows.
-                  throw new Error("Result session ended before the requested page offset");
+            try {
+              while (true) {
+                const pageResults = await api.executeMulti(executionConnectionId, executionDatabase, sqlToExecute, executionSchema, executionId, {
+                  ...executionOptions,
+                  resultSessionId: sessionId,
+                });
+                const page = pageResults[0];
+                if (!page) return pageResults;
+                pageCount += 1;
+                executionMs += page.execution_time_ms;
+                if (!page.query_timings_ms) completeTimings = false;
+                else for (const [key, value] of Object.entries(page.query_timings_ms)) timings[key] = (timings[key] ?? 0) + value;
+                // Offset jumps consume several cursor pages before publication.
+                // Keep their timings as well, without retaining skipped rows.
+                const timingSummary = { query_timings_ms: completeTimings ? { ...timings } : undefined, execution_time_ms: executionMs, timing_page_count: pageCount };
+                if (skipped + page.rows.length > pageOffset) {
+                  const start = pageOffset - skipped;
+                  const limit = typeof pageLimit === "number" ? pageLimit : page.rows.length - start;
+                  return [{ ...page, ...timingSummary, rows: page.rows.slice(start, start + limit) }];
                 }
-                return [{ ...page, ...timingSummary, rows: [] }];
+                skipped += page.rows.length;
+                if (!page.has_more || !page.session_id) {
+                  if (page.has_more) {
+                    // The cursor session ended before the requested offset;
+                    // returning the short page would show the wrong rows.
+                    throw new Error("Result session ended before the requested page offset");
+                  }
+                  return [{ ...page, ...timingSummary, rows: [] }];
+                }
+                sessionId = page.session_id;
+                const replayTab = findExecutionTab(id);
+                if (replayTab !== tab || replayTab.executionId !== executionId || replayTab.isCancelling || (replayTab.cancelRequestCount ?? 0) !== cancelRequestCountAtStart || manualTransactionTargetEpoch(replayTab) !== executionTargetEpoch) {
+                  throw new Error("Query canceled");
+                }
               }
-              sessionId = page.session_id;
+            } catch (error) {
+              if (sessionId) {
+                try {
+                  await api.closeQuerySession(executionConnectionId, executionDatabase, sessionId, executionClientSessionId, executionCatalog);
+                } catch (closeError) {
+                  queryExecutionLog("warn", "offset-replay-session-close:error", { traceId, sessionId, error: closeError });
+                }
+              }
+              throw error;
             }
           })();
         }
@@ -8925,7 +8996,7 @@ export const useQueryStore = defineStore("query", () => {
       let offset = 0;
       const clientSessionId = tabClientSessionId(tab, "export");
       const exportExecutionId = uuid();
-      const useAgentCursor = conn?.db_type === "sqlserver" && conn?.driver_profile?.trim().toLowerCase() === "sqlserver-legacy";
+      const useAgentCursor = usesAgentCursorForTableData(conn?.db_type, conn?.driver_profile);
       let sessionId: string | undefined;
 
       try {
@@ -8933,6 +9004,7 @@ export const useQueryStore = defineStore("query", () => {
           const sql = await api.buildTableSelectSql({
             databaseType: effectiveDbType,
             driverProfile: conn?.driver_profile,
+            serverVersion: conn?.database_info?.productVersion,
             identifierQuote,
             database: tableMeta.database,
             schema: tableMeta.schema,
@@ -8971,19 +9043,33 @@ export const useQueryStore = defineStore("query", () => {
                 },
           );
           const result = results[0];
-          if (!result) break;
+          if (!result) {
+            if (useAgentCursor) throw new Error("Missing cursor result during table export");
+            break;
+          }
+          const nextSessionId = result.session_id?.trim() || undefined;
+          if (useAgentCursor) {
+            sessionId = nextSessionId ?? sessionId;
+            if (conn?.db_type === "cassandra" && (result.truncated || typeof result.has_more !== "boolean")) throw new Error("Incomplete cursor result during table export");
+            if (result.has_more === true && !nextSessionId) throw new Error("Result session ended before table export completed");
+          }
           if (columns.length === 0) columns = result.columns;
           rows.push(...result.rows);
           executionTimeMs += result.execution_time_ms ?? 0;
           onProgress?.({ rowsExported: rows.length, totalRows });
-          sessionId = result.session_id ?? undefined;
+          sessionId = nextSessionId;
           const shouldFetchNextPage = useAgentCursor ? result.has_more === true : result.rows.length >= pageLimit;
           if (!shouldFetchNextPage) break;
           offset += result.rows.length;
         }
       } finally {
-        if (sessionId) void api.closeQuerySession(tab.connectionId, executionDatabase, sessionId, clientSessionId, tableMeta.catalog);
-        void closeClientSessionId(tab.connectionId, executionDatabase, clientSessionId, tableMeta.catalog, { tabId: tab.id });
+        try {
+          if (sessionId) await api.closeQuerySession(tab.connectionId, executionDatabase, sessionId, clientSessionId, tableMeta.catalog);
+        } catch (error) {
+          queryExecutionLog("warn", "table-export-session-close:error", { sessionId, error });
+        } finally {
+          await closeClientSessionId(tab.connectionId, executionDatabase, clientSessionId, tableMeta.catalog, { tabId: tab.id });
+        }
       }
 
       return {
@@ -9072,7 +9158,9 @@ export const useQueryStore = defineStore("query", () => {
         if (pageDocuments.length === 0 || pageDocuments.length < plan.requestLimit || reachedLogicalLimit || reachedExactTotal) break;
       }
 
-      const result = mongoDocumentsToQueryResult(documents, performance.now() - exportStartedAt, totalRows ?? documents.length, copyDocuments, totalRows !== null);
+      // Full exports return source rows (CSV/SQL text), not the live grid's
+      // BSON-faithful cell encoding.
+      const result = mongoDocumentsToQueryResult(documents, performance.now() - exportStartedAt, totalRows ?? documents.length, copyDocuments, totalRows !== null, { documentGridValues: false });
       if (result.columns.length === 0) {
         result.columns = tab.result.columns;
         result.column_types = tab.result.column_types;
@@ -9195,6 +9283,7 @@ export const useQueryStore = defineStore("query", () => {
       keysetOptimizationEnabled: settings.queryExportKeysetOptimizationEnabled,
       csvQuoteMode: settings.csvQuoteMode,
       clientSessionId,
+      nullLiteral: csvNullLiteralForMode(settings.csvNullMode),
       executionId: uuid(),
       exportTableName: options.exportTableName,
       exportColumnTypes: options.exportColumnTypes,
@@ -9235,6 +9324,7 @@ export const useQueryStore = defineStore("query", () => {
       keysetOptimizationEnabled: settings.queryExportKeysetOptimizationEnabled,
       csvQuoteMode: settings.csvQuoteMode,
       clientSessionId: `${tabClientSessionId(tab, "export")}:${exportId}`,
+      nullLiteral: csvNullLiteralForMode(settings.csvNullMode),
       executionId: uuid(),
       numericColumnRightAlign: settings.numericColumnRightAlign,
       columnComments,
@@ -9368,6 +9458,7 @@ export const useQueryStore = defineStore("query", () => {
     openMongoGridFs,
     openMongoBucket,
     openUserAdmin,
+    openXuguUserAdmin,
     openProcessList,
     openSqlServerActivityTrace,
     openMysqlDashboard,
@@ -9393,6 +9484,7 @@ export const useQueryStore = defineStore("query", () => {
     openExternalSqlFile,
     openSavedSql,
     hydrateSavedSqlTabs,
+    syncSavedSqlExecutionTargets,
     togglePinnedTab,
     reorderTab,
     createExecutionTargetGuard,

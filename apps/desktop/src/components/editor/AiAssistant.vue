@@ -1,9 +1,9 @@
 <script setup lang="ts">
 import { computed, defineAsyncComponent, h, nextTick, onMounted, onUnmounted, reactive, ref, toRaw, watch, type Component } from "vue";
 import { uuid } from "@/lib/common/utils";
-import { deferUntilPanelResizeEnd } from "@/lib/app/panelResizeState";
 import { useI18n } from "vue-i18n";
 import { translateBackendError } from "@/i18n/backend-errors";
+import { deferUntilPanelResizeEnd, isPanelResizing } from "@/lib/app/panelResizeState";
 import {
   ArrowDown,
   ArrowUp,
@@ -66,6 +66,7 @@ import { useSavedSqlStore } from "@/stores/savedSqlStore";
 import { usePromptTemplateStore } from "@/stores/promptTemplateStore";
 import { useUserSkillStore } from "@/stores/userSkillStore";
 import { buildSelectedSkillChips, capSkillsToCharLimit, removeSkillIds, userSkillSourceOfId } from "@/lib/ai/userSkillSelection";
+import { aiConversationTypographyCssVariables } from "@/lib/ai/aiTypography";
 import { ACTIVE_SKILLS_TOTAL_MAX, type ReadUserSkill, type ReadUserSkillFailure, type UserSkillFailureReason, type UserSkillRootSettings } from "@/types/userSkills";
 import { supportsAiAssistantContext } from "@/lib/database/databaseFeatureSupport";
 import ConnectionIcon from "@/components/icons/ConnectionIcon.vue";
@@ -210,6 +211,12 @@ const AiHtmlPreview = defineAsyncComponent({
   loader: () => import("@/components/ai/rich/AiHtmlPreview.vue"),
 });
 const settings = useSettingsStore();
+const aiTypographyStyle = computed(() =>
+  aiConversationTypographyCssVariables({
+    fontFamily: settings.editorSettings.aiFontFamily,
+    fontSize: settings.editorSettings.aiFontSize,
+  }),
+);
 const connectionStore = useConnectionStore();
 const savedSqlStore = useSavedSqlStore();
 const promptTemplateStore = usePromptTemplateStore();
@@ -1221,19 +1228,27 @@ const pendingCompaction = ref<{ summary: string; compactedMessages: number } | n
 const AI_TEXTAREA_MIN_HEIGHT_PX = 64;
 const AI_TEXTAREA_MAX_PANEL_RATIO = 0.5;
 const AI_TEXTAREA_HEIGHT_STORAGE_KEY = "dbx-ai-textarea-height";
+const AI_RESPONSIVE_DRAG_MEASURE_STEP_PX = 16;
 
 const textareaHeight = ref<number>(AI_TEXTAREA_MIN_HEIGHT_PX);
 const assistantRootRef = ref<HTMLElement | null>(null);
 const promptPanelRef = ref<HTMLElement | null>(null);
 const compactContextControls = ref(false);
-const compactActionControls = ref(false);
+const compactModelControl = ref(false);
+const compactModeActionControl = ref(false);
 const isResizing = ref<boolean>(false);
 let resizeStartY = 0;
 let resizeStartHeight = 0;
 let promptPanelResizeObserver: ResizeObserver | undefined;
 let responsiveControlMeasureFrame: number | null = null;
 let responsiveControlMeasureForce = false;
+let responsiveControlObservedWidth: number | null = null;
 let lastResponsiveControlWidth: number | null = null;
+let latestResponsiveControlDragWidth: number | null = null;
+let lastResponsiveControlDragMeasureWidth: number | null = null;
+let responsiveControlDragMeasureRunning = false;
+let responsiveControlDragMeasureQueued = false;
+let responsiveControlDragEpoch = 0;
 
 interface AiTableMentionCandidate {
   kind: "table";
@@ -5018,6 +5033,21 @@ function dismissAwayUpdates() {
 
 onMounted(async () => {
   assistantViewMounted = true;
+  // Register the resize/drop wiring before the first `await`: the bootstrap below
+  // can take several frames (persisted runs plus the dynamic import of the code
+  // highlighter), and a panel drag, window resize, or file/table drop during that
+  // window would otherwise be dropped, leaving the composer on a stale
+  // compact/expanded state — and the listeners of a panel closed mid-load were
+  // added after onUnmounted had already run, leaking them.
+  window.addEventListener("resize", handleWindowResize);
+  document.addEventListener("dbx:tauri-file-drop", onTauriFileDrop as EventListener);
+  window.addEventListener(DBX_TABLE_REFERENCE_DROP_EVENT, onTableReferenceDropEvent);
+  if (typeof ResizeObserver !== "undefined" && assistantRootRef.value) {
+    promptPanelResizeObserver = new ResizeObserver(handleObservedPanelResize);
+    promptPanelResizeObserver.observe(assistantRootRef.value);
+    if (promptPanelRef.value) promptPanelResizeObserver.observe(promptPanelRef.value);
+  }
+  scheduleResponsiveControlMeasurement(true);
   const savedHeight = localStorage.getItem(AI_TEXTAREA_HEIGHT_STORAGE_KEY);
   if (savedHeight) {
     const height = parseInt(savedHeight, 10);
@@ -5122,16 +5152,6 @@ onMounted(async () => {
   shikiCodeHighlighter.value = await createAiShikiCodeHighlighter({
     appearance: () => aiCodeAppearance.value,
   }).catch(() => undefined);
-
-  window.addEventListener("resize", handlePanelResize);
-  document.addEventListener("dbx:tauri-file-drop", onTauriFileDrop as EventListener);
-  window.addEventListener(DBX_TABLE_REFERENCE_DROP_EVENT, onTableReferenceDropEvent);
-  if (typeof ResizeObserver !== "undefined" && assistantRootRef.value) {
-    promptPanelResizeObserver = new ResizeObserver(handlePanelResize);
-    promptPanelResizeObserver.observe(assistantRootRef.value);
-    if (promptPanelRef.value) promptPanelResizeObserver.observe(promptPanelRef.value);
-  }
-  scheduleResponsiveControlMeasurement(true);
 });
 
 function maxTextareaHeight() {
@@ -5146,9 +5166,24 @@ function clampTextareaHeight(height: number) {
   return Math.max(AI_TEXTAREA_MIN_HEIGHT_PX, Math.min(maxTextareaHeight(), Math.round(height)));
 }
 
-function handlePanelResize() {
+function handleWindowResize() {
+  handlePanelResize();
+}
+
+function handleObservedPanelResize(entries: ResizeObserverEntry[]) {
+  const promptPanel = promptPanelRef.value;
+  const promptPanelEntry = promptPanel ? entries.find((entry) => entry.target === promptPanel) : undefined;
+  handlePanelResize(promptPanelEntry?.contentRect.width);
+}
+
+function handlePanelResize(observedPanelWidth?: number) {
+  if (isPanelResizing.value) {
+    deferUntilPanelResizeEnd(resyncPromptPanelAfterPanelResize);
+    if (typeof observedPanelWidth === "number") scheduleResponsiveControlDragMeasurement(observedPanelWidth);
+    return;
+  }
   textareaHeight.value = clampTextareaHeight(textareaHeight.value);
-  scheduleResponsiveControlMeasurement();
+  scheduleResponsiveControlMeasurement(false, observedPanelWidth);
 }
 
 function hasHorizontalOverflow(element: HTMLElement | null): boolean {
@@ -5160,48 +5195,99 @@ function hasOverflowingLabel(element: HTMLElement | null, selector: string): boo
   return Array.from(element.querySelectorAll<HTMLElement>(selector)).some((label) => label.scrollWidth > label.clientWidth + 1);
 }
 
-async function measureResponsiveControls(force = false) {
-  const panel = promptPanelRef.value;
-  if (!panel) return;
-  // Reading clientWidth/scrollWidth here forces a document-wide synchronous
-  // relayout, and the AI panel divider drag fires resize events every frame.
-  // Skip measurements while the drag is in flight and re-measure once at the end.
-  if (
-    deferUntilPanelResizeEnd(() => {
-      void measureResponsiveControls(force);
-    })
-  )
-    return;
-  const panelWidth = panel.clientWidth;
+function actionControlsOverflow(actionRow: HTMLElement | null): boolean {
+  return hasHorizontalOverflow(actionRow) || hasOverflowingLabel(actionRow, ".ai-mode-action-label, .ai-model-selector-label, .ai-prompt-queue-label");
+}
+
+function resyncPromptPanelAfterPanelResize() {
+  responsiveControlDragEpoch += 1;
+  latestResponsiveControlDragWidth = null;
+  lastResponsiveControlDragMeasureWidth = null;
+  responsiveControlDragMeasureQueued = false;
+  if (!assistantViewMounted) return;
+  textareaHeight.value = clampTextareaHeight(textareaHeight.value);
+  scheduleResponsiveControlMeasurement(true);
+}
+
+async function applyResponsiveControlMeasurement(panel: HTMLElement, panelWidth: number, force: boolean, panelResizeEpoch?: number) {
   if (!force && lastResponsiveControlWidth === panelWidth) return;
 
-  // Measure the full labels before deciding to compact. This lets a wide
-  // composer recover from icon mode after it grows, while the actual
-  // overflow checks decide independently for the context and action rows.
-  if (compactContextControls.value || compactActionControls.value) {
+  if (compactContextControls.value || compactModelControl.value || compactModeActionControl.value) {
     compactContextControls.value = false;
-    compactActionControls.value = false;
+    compactModelControl.value = false;
+    compactModeActionControl.value = false;
     await nextTick();
+    if (panelResizeEpoch !== undefined && (!isPanelResizing.value || panelResizeEpoch !== responsiveControlDragEpoch)) return;
   }
 
   const contextRow = panel.querySelector<HTMLElement>("[data-ai-composer-context-row]");
   const actionRow = panel.querySelector<HTMLElement>("[data-ai-composer-actions]");
   const contextOverflow = hasHorizontalOverflow(contextRow) || hasOverflowingLabel(contextRow, ".ai-template-selector-label, .ai-skills-selector-label");
-  const actionOverflow = hasHorizontalOverflow(actionRow) || hasOverflowingLabel(actionRow, ".ai-mode-action-label, .ai-model-selector-label, .ai-prompt-queue-label");
 
   compactContextControls.value = contextOverflow;
-  compactActionControls.value = actionOverflow;
-  lastResponsiveControlWidth = panelWidth;
+  if (actionControlsOverflow(actionRow)) {
+    compactModelControl.value = true;
+    await nextTick();
+    if (panelResizeEpoch !== undefined && (!isPanelResizing.value || panelResizeEpoch !== responsiveControlDragEpoch)) return;
+    compactModeActionControl.value = actionControlsOverflow(actionRow);
+  }
+  lastResponsiveControlWidth = panelResizeEpoch === undefined ? panelWidth : (latestResponsiveControlDragWidth ?? panelWidth);
 }
 
-function scheduleResponsiveControlMeasurement(force = false) {
+async function flushResponsiveControlDragMeasurements() {
+  if (responsiveControlDragMeasureRunning) return;
+  responsiveControlDragMeasureRunning = true;
+  const panelResizeEpoch = responsiveControlDragEpoch;
+  try {
+    while (responsiveControlDragMeasureQueued && isPanelResizing.value && panelResizeEpoch === responsiveControlDragEpoch) {
+      responsiveControlDragMeasureQueued = false;
+      const panelWidth = latestResponsiveControlDragWidth;
+      const panel = promptPanelRef.value;
+      if (panelWidth === null || !panel) continue;
+      if (lastResponsiveControlDragMeasureWidth !== null && Math.abs(panelWidth - lastResponsiveControlDragMeasureWidth) < AI_RESPONSIVE_DRAG_MEASURE_STEP_PX) continue;
+      lastResponsiveControlDragMeasureWidth = panelWidth;
+      await applyResponsiveControlMeasurement(panel, panelWidth, true, panelResizeEpoch);
+      const latestWidth = latestResponsiveControlDragWidth;
+      if (latestWidth !== null && Math.abs(latestWidth - panelWidth) >= AI_RESPONSIVE_DRAG_MEASURE_STEP_PX) responsiveControlDragMeasureQueued = true;
+    }
+  } finally {
+    responsiveControlDragMeasureRunning = false;
+    if (responsiveControlDragMeasureQueued && isPanelResizing.value) void flushResponsiveControlDragMeasurements();
+  }
+}
+
+function scheduleResponsiveControlDragMeasurement(observedPanelWidth: number) {
+  latestResponsiveControlDragWidth = Math.round(observedPanelWidth);
+  responsiveControlDragMeasureQueued = true;
+  void flushResponsiveControlDragMeasurements();
+}
+
+async function measureResponsiveControls(force = false, observedPanelWidth?: number) {
+  const panel = promptPanelRef.value;
+  if (!panel) return;
+
+  if (isPanelResizing.value) {
+    deferUntilPanelResizeEnd(resyncPromptPanelAfterPanelResize);
+    if (typeof observedPanelWidth === "number") scheduleResponsiveControlDragMeasurement(observedPanelWidth);
+    return;
+  }
+
+  lastResponsiveControlDragMeasureWidth = null;
+  const panelWidth = typeof observedPanelWidth === "number" ? Math.round(observedPanelWidth) : panel.clientWidth;
+  await applyResponsiveControlMeasurement(panel, panelWidth, force);
+}
+
+function scheduleResponsiveControlMeasurement(force = false, observedPanelWidth?: number) {
   responsiveControlMeasureForce ||= force;
+  if (typeof observedPanelWidth === "number") responsiveControlObservedWidth = observedPanelWidth;
   if (responsiveControlMeasureFrame !== null) return;
   const measure = () => {
     responsiveControlMeasureFrame = null;
     const forceMeasure = responsiveControlMeasureForce;
+    const measuredPanelWidth = responsiveControlObservedWidth;
     responsiveControlMeasureForce = false;
-    void measureResponsiveControls(forceMeasure);
+    responsiveControlObservedWidth = null;
+    void measureResponsiveControls(forceMeasure, measuredPanelWidth ?? undefined);
   };
   if (typeof window !== "undefined" && typeof window.requestAnimationFrame === "function") {
     responsiveControlMeasureFrame = window.requestAnimationFrame(measure);
@@ -5289,7 +5375,7 @@ onUnmounted(() => {
   // 若卸载时仍在拖拽，复位 body 样式，避免全局残留
   document.body.style.userSelect = "";
   document.body.style.cursor = "";
-  window.removeEventListener("resize", handlePanelResize);
+  window.removeEventListener("resize", handleWindowResize);
   document.removeEventListener("dbx:tauri-file-drop", onTauriFileDrop as EventListener);
   window.removeEventListener(DBX_TABLE_REFERENCE_DROP_EVENT, onTableReferenceDropEvent);
   promptPanelResizeObserver?.disconnect();
@@ -5298,6 +5384,11 @@ onUnmounted(() => {
     responsiveControlMeasureFrame = null;
   }
   responsiveControlMeasureForce = false;
+  responsiveControlObservedWidth = null;
+  latestResponsiveControlDragWidth = null;
+  lastResponsiveControlDragMeasureWidth = null;
+  responsiveControlDragMeasureQueued = false;
+  responsiveControlDragEpoch += 1;
 });
 
 function triggerAction(action: AiAction, instruction?: string) {
@@ -5419,7 +5510,7 @@ async function openExternalUrl(url: string) {
 </script>
 
 <template>
-  <div ref="assistantRootRef" data-ai-assistant-root class="flex h-full min-h-0 flex-col overflow-hidden" @dragenter="onAttachmentDragEnter" @dragover="onAttachmentDragOver" @dragleave="onAttachmentDragLeave" @drop="onAttachmentDrop">
+  <div ref="assistantRootRef" data-ai-assistant-root class="flex h-full min-h-0 flex-col overflow-hidden" :style="aiTypographyStyle" @dragenter="onAttachmentDragEnter" @dragover="onAttachmentDragOver" @dragleave="onAttachmentDragLeave" @drop="onAttachmentDrop">
     <div class="flex items-center gap-2 border-b px-3 shrink-0" :class="settings.editorSettings.appLayout === 'classic' ? 'h-9' : 'h-10'">
       <span class="flex flex-1 self-stretch items-center truncate text-xs font-medium" data-tauri-drag-region>
         {{ chatTitle }}
@@ -5655,7 +5746,7 @@ async function openExternalUrl(url: string) {
                     data-edit-textarea
                     v-model="editingContent"
                     rows="3"
-                    class="w-full resize-none rounded-lg border bg-background px-3 py-2 text-xs outline-none focus:ring-1 focus:ring-primary"
+                    class="ai-conversation-text w-full resize-none rounded-lg border bg-background px-3 py-2 text-xs outline-none focus:ring-1 focus:ring-primary"
                     @keydown="onEditKeydown($event, i)"
                     @compositionstart="editCompositionActive = true"
                     @compositionend="editCompositionActive = false"
@@ -5707,7 +5798,7 @@ async function openExternalUrl(url: string) {
                         class="w-44"
                       />
                     </div>
-                    <div v-if="messageReferenceMentions(msg).length || msg.content" class="min-w-0 rounded-lg bg-primary px-3 py-2 text-xs text-primary-foreground">
+                    <div v-if="messageReferenceMentions(msg).length || msg.content" class="ai-conversation-text min-w-0 rounded-lg bg-primary px-3 py-2 text-xs text-primary-foreground">
                       <div v-if="messageReferenceMentions(msg).length" class="mb-1.5 flex flex-wrap justify-end gap-1">
                         <button
                           v-for="mention in messageReferenceMentions(msg)"
@@ -5777,7 +5868,7 @@ async function openExternalUrl(url: string) {
 
             <!-- Keep the metadata row as wide as the reply card so its export action stays right-aligned. -->
             <div v-else-if="msg.content || msg.reasoning || msg.isThinking" class="flex w-full max-w-[95%] min-w-0 flex-col">
-              <div class="w-full rounded-lg bg-muted px-3 py-2 text-xs leading-relaxed [overflow-wrap:anywhere]">
+              <div data-ai-assistant-message-content class="ai-conversation-text w-full rounded-lg bg-muted px-3 py-2 text-xs leading-relaxed [overflow-wrap:anywhere]">
                 <div v-if="msg.reasoning || msg.isThinking" class="mb-2">
                   <button class="flex items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground transition-colors" @click="toggleReasoning()">
                     <ChevronRight class="h-3 w-3 transition-transform duration-200" :class="{ 'rotate-90': reasoningExpanded }" />
@@ -6015,7 +6106,6 @@ async function openExternalUrl(url: string) {
                 @update:model-value="(v) => changeConnection(v)"
               />
               <template v-if="boundConnection && showAiDatabaseSelector">
-                <Database class="h-3 w-3 shrink-0 text-foreground/40" />
                 <Popover
                   @update:open="
                     (open: boolean) => {
@@ -6024,7 +6114,8 @@ async function openExternalUrl(url: string) {
                   "
                 >
                   <PopoverTrigger as-child>
-                    <Button variant="ghost" :title="selectedDatabaseLabel" :class="['h-5 min-w-0 max-w-64 justify-start border-0 p-0 px-1 text-xs font-normal text-foreground/80 shadow-none', showAiSchemaSelector && 'flex-1']">
+                    <Button variant="ghost" :title="selectedDatabaseLabel" :aria-label="selectedDatabaseLabel" :class="['ai-database-selector-trigger h-5 min-w-0 max-w-64 justify-start gap-1 border-0 p-0 px-1 text-xs font-normal text-foreground/80 shadow-none', showAiSchemaSelector && 'flex-1']">
+                      <Database class="ai-database-selector-icon h-3 w-3 shrink-0 text-foreground/40" />
                       <span class="truncate">{{ selectedDatabaseLabel }}</span>
                     </Button>
                   </PopoverTrigger>
@@ -6330,7 +6421,7 @@ async function openExternalUrl(url: string) {
             ref="promptTextareaRef"
             v-model="prompt"
             :style="{ height: `${textareaHeight}px`, maxHeight: `${maxTextareaHeight()}px` }"
-            class="w-full resize-none bg-transparent text-xs outline-none placeholder:text-muted-foreground mb-1"
+            class="ai-conversation-text w-full resize-none bg-transparent text-xs outline-none placeholder:text-muted-foreground mb-1"
             :placeholder="activePlaceholder"
             @input="refreshMentionState"
             @click="refreshMentionState"
@@ -6347,7 +6438,7 @@ async function openExternalUrl(url: string) {
             <Clock class="h-3.5 w-3.5 shrink-0" />
             <span>{{ t("ai.status.longRunningHint") }}</span>
           </div>
-          <div data-ai-composer-actions :class="['ai-prompt-action-row flex min-w-0 flex-nowrap items-center gap-1.5 overflow-hidden', compactActionControls && 'ai-prompt-action-row--compact']">
+          <div data-ai-composer-actions :class="['ai-prompt-action-row flex min-w-0 flex-nowrap items-center gap-1.5 overflow-hidden', compactModelControl && 'ai-prompt-action-row--model-compact', compactModeActionControl && 'ai-prompt-action-row--mode-compact']">
             <Tooltip>
               <TooltipTrigger as-child>
                 <Button variant="ghost" size="icon" class="h-7 w-7 shrink-0" :disabled="isGenerating" @click="selectCsvFile">
@@ -6675,12 +6766,14 @@ async function openExternalUrl(url: string) {
 </template>
 
 <style scoped>
-.ai-prompt-context-row--compact .ai-prompt-context-spacer {
-  flex: 0 0 0;
+.ai-conversation-text {
+  font-family: var(--dbx-ai-content-font-family, inherit);
+  font-size: var(--dbx-ai-content-font-size, 0.75rem);
 }
 
 .ai-prompt-context-row--compact .ai-template-selector-trigger,
-.ai-prompt-context-row--compact .ai-skills-selector-trigger {
+.ai-prompt-context-row--compact .ai-skills-selector-trigger,
+.ai-prompt-context-row--compact .ai-database-selector-trigger {
   flex: 0 0 1.5rem;
   width: 1.5rem;
   max-width: 1.5rem;
@@ -6692,17 +6785,18 @@ async function openExternalUrl(url: string) {
 .ai-prompt-context-row--compact .ai-template-selector-label,
 .ai-prompt-context-row--compact .ai-template-selector-chevron,
 .ai-prompt-context-row--compact .ai-skills-selector-label,
-.ai-prompt-context-row--compact .ai-skills-selector-count {
+.ai-prompt-context-row--compact .ai-skills-selector-count,
+.ai-prompt-context-row--compact .ai-database-selector-trigger > span {
   display: none;
 }
 
-.ai-prompt-action-row--compact {
+.ai-prompt-action-row--mode-compact {
   gap: 0.25rem;
 }
 
-.ai-prompt-action-row--compact .ai-mode-action-trigger,
-.ai-prompt-action-row--compact .ai-mode-static-trigger,
-.ai-prompt-action-row--compact .ai-model-selector-trigger {
+.ai-prompt-action-row--model-compact .ai-model-selector-trigger,
+.ai-prompt-action-row--mode-compact .ai-mode-action-trigger,
+.ai-prompt-action-row--mode-compact .ai-mode-static-trigger {
   flex: 0 0 1.75rem;
   width: 1.75rem;
   max-width: 1.75rem;
@@ -6711,29 +6805,29 @@ async function openExternalUrl(url: string) {
   padding: 0;
 }
 
-.ai-prompt-action-row--compact .ai-mode-action-label,
-.ai-prompt-action-row--compact .ai-mode-action-chevron,
-.ai-prompt-action-row--compact .ai-model-selector-label,
-.ai-prompt-action-row--compact .ai-model-selector-chevron {
+.ai-prompt-action-row--model-compact .ai-model-selector-label,
+.ai-prompt-action-row--model-compact .ai-model-selector-chevron,
+.ai-prompt-action-row--mode-compact .ai-mode-action-label,
+.ai-prompt-action-row--mode-compact .ai-mode-action-chevron {
   display: none;
 }
 
-.ai-prompt-action-row--compact .ai-model-selector-trigger {
+.ai-prompt-action-row--model-compact .ai-model-selector-trigger {
   min-width: 1.75rem;
 }
 
-.ai-prompt-action-row--compact .ai-prompt-send-control {
+.ai-prompt-action-row--mode-compact .ai-prompt-send-control {
   flex: 0 0 auto;
 }
 
-.ai-prompt-action-row--compact .ai-prompt-queue-control {
+.ai-prompt-action-row--mode-compact .ai-prompt-queue-control {
   width: 1.75rem;
   height: 1.75rem;
   justify-content: center;
   padding: 0;
 }
 
-.ai-prompt-action-row--compact .ai-prompt-queue-label {
+.ai-prompt-action-row--mode-compact .ai-prompt-queue-label {
   display: none;
 }
 
@@ -6791,7 +6885,7 @@ async function openExternalUrl(url: string) {
   border-radius: 0.25rem;
   background: var(--muted);
   padding: 0.125rem 0.375rem;
-  font-size: 11px;
+  font-size: var(--dbx-ai-inline-code-font-size, 11px);
   font-family: ui-monospace, monospace;
 }
 .ai-markdown :deep(pre) {
@@ -6873,6 +6967,11 @@ html.dbx-legacy-webview.dark .ai-markdown :deep(.ai-markdown-table-wrap:hover::-
   min-height: 1lh;
 }
 
+.ai-code-block {
+  font-family: ui-monospace, monospace;
+  font-size: var(--dbx-ai-code-font-size, 0.75rem);
+}
+
 .ai-message-scroll :deep([data-slot="scroll-area-viewport"]) {
   overflow-anchor: none;
 }
@@ -6889,20 +6988,5 @@ html.dbx-legacy-webview.dark .ai-markdown :deep(.ai-markdown-table-wrap:hover::-
   z-index: 1;
   height: 9px;
   cursor: ns-resize;
-}
-
-.resize-handle::before {
-  content: "";
-  position: absolute;
-  top: 3px;
-  left: 0;
-  right: 0;
-  height: 1px;
-  background-color: var(--border);
-  transition: background-color 0.15s ease;
-}
-
-.resize-handle:hover::before {
-  background-color: color-mix(in srgb, var(--foreground) 20%, transparent);
 }
 </style>

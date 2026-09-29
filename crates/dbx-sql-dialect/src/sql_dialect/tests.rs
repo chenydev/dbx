@@ -1,3 +1,4 @@
+use super::identifiers::quote_gaussdb_jdbc_identifier;
 use super::*;
 use crate::models::connection::DatabaseType;
 
@@ -199,6 +200,15 @@ fn maps_table_pagination_strategy_by_database_type() {
     assert_eq!(table_pagination_strategy(Some(DatabaseType::Questdb)), TablePaginationStrategy::QuestDbLimit);
     assert_eq!(table_pagination_strategy(Some(DatabaseType::Oracle)), TablePaginationStrategy::Rownum);
     assert_eq!(table_pagination_strategy(Some(DatabaseType::Oscar)), TablePaginationStrategy::Rownum);
+    assert_eq!(table_pagination_strategy(Some(DatabaseType::Cassandra)), TablePaginationStrategy::AgentMaxRows);
+    assert_eq!(
+        pagination_strategy(Some(DatabaseType::Cassandra), PaginationContext::BoundedRead),
+        TablePaginationStrategy::LimitOffset
+    );
+    assert_eq!(
+        pagination_strategy(Some(DatabaseType::Cassandra), PaginationContext::UserQuery),
+        TablePaginationStrategy::AgentMaxRows
+    );
     assert_eq!(
         pagination_strategy(Some(DatabaseType::Oracle), PaginationContext::BoundedRead),
         TablePaginationStrategy::Rownum
@@ -219,6 +229,22 @@ fn maps_table_pagination_strategy_by_database_type() {
     // Both Spanner dialects support `LIMIT n OFFSET m`; pin the fallback.
     assert_eq!(table_pagination_strategy(Some(DatabaseType::Spanner)), TablePaginationStrategy::LimitOffset);
     assert_eq!(table_pagination_strategy(None), TablePaginationStrategy::LimitOffset);
+}
+
+#[test]
+fn cassandra_table_data_pagination_uses_the_agent_cursor() {
+    for offset in [0, 100, 200] {
+        assert_eq!(
+            build_table_data_select_sql(TableDataSelectSqlOptions {
+                database_type: Some(DatabaseType::Cassandra),
+                table_name: "paged_rows".to_string(),
+                limit: Some(100),
+                offset: Some(offset),
+                ..Default::default()
+            }),
+            "SELECT * FROM \"paged_rows\";"
+        );
+    }
 }
 
 #[test]
@@ -1551,6 +1577,37 @@ fn builds_oracle_and_neo4j_table_data_queries() {
 }
 
 #[test]
+fn neo4j_element_id_function_follows_the_connected_server_version() {
+    // Neo4j 4.x and older only know `id()`; `elementId()` arrived in 5.0.
+    assert_eq!(neo4j_element_id_function(Some("4.4.44")), "id");
+    assert_eq!(neo4j_element_id_function(Some("Neo4j/4.4.44")), "id");
+    assert_eq!(neo4j_element_id_function(Some("Neo4j 4.4.44 (community)")), "id");
+    assert_eq!(neo4j_element_id_function(Some("3.5.35")), "id");
+    assert_eq!(neo4j_element_id_function(Some("Neo4j/5.26.0")), "elementId");
+    assert_eq!(neo4j_element_id_function(Some("Neo4j/2025.01.0")), "elementId");
+    // Unknown or unparsable versions keep the current spelling.
+    assert_eq!(neo4j_element_id_function(None), "elementId");
+    assert_eq!(neo4j_element_id_function(Some("")), "elementId");
+    assert_eq!(neo4j_element_id_function(Some("Neo4j Community")), "elementId");
+}
+
+#[test]
+fn builds_neo4j_table_select_with_the_legacy_element_id_on_neo4j_4() {
+    assert_eq!(
+        build_table_data_select_sql(TableDataSelectSqlOptions {
+            database_type: Some(DatabaseType::Neo4j),
+            table_name: "Employee".to_string(),
+            primary_keys: vec!["id".to_string()],
+            columns: vec!["id".to_string(), "role".to_string()],
+            server_version: Some("Neo4j/4.4.44".to_string()),
+            limit: Some(100),
+            ..Default::default()
+        }),
+        "MATCH (n:`Employee`) RETURN id(n) AS `__DBX_ELEMENT_ID`, n.`id` AS `id`, n.`role` AS `role` LIMIT 100;"
+    );
+}
+
+#[test]
 fn oracle_unknown_table_type_does_not_assume_rowid_support() {
     assert_eq!(
         build_table_data_select_sql(TableDataSelectSqlOptions {
@@ -1637,4 +1694,58 @@ fn oracle_view_later_pages_keep_rownum_pagination() {
 fn normalizes_where_input_with_multibyte_identifier_prefix() {
     assert_eq!(normalize_where_input(Some("`客户名称` = '示例客户'")), "`客户名称` = '示例客户'");
     assert_eq!(normalize_where_input(Some("WHERE `客户名称` = '示例客户';")), "`客户名称` = '示例客户'");
+}
+
+// Grid saves re-quote the table identity carried by the query result. For
+// PostgreSQL-family engines reached through an agent-reported identifier quote,
+// `quote_gaussdb_jdbc_identifier` only leaves all-lower-case identifiers
+// unquoted, so a folded (`mss_check_sales_item`) write resolves while the
+// query's original casing (`term."MSS_CHECK_SALES_ITEM"`) fails with
+// `relation ... does not exist` on a lower-case-stored table (issue #10567).
+// The frontend folds unquoted SQL-text identifiers before they reach this
+// layer; these assertions lock the quoting contract that makes that fix work.
+#[test]
+fn postgres_family_table_data_quoting_resolves_folded_identifiers() {
+    let quote = Some("\"".to_string());
+    assert_eq!(quote_gaussdb_jdbc_identifier("mss_check_sales_item", "\""), "mss_check_sales_item");
+    assert_eq!(quote_gaussdb_jdbc_identifier("MSS_CHECK_SALES_ITEM", "\""), "\"MSS_CHECK_SALES_ITEM\"");
+    assert_eq!(quote_gaussdb_jdbc_identifier("term", "\""), "term");
+
+    assert_eq!(
+        table_data_qualified_table_name(
+            Some(DatabaseType::Postgres),
+            Some("term"),
+            "mss_check_sales_item",
+            quote.as_deref()
+        ),
+        "term.mss_check_sales_item"
+    );
+    assert_eq!(
+        table_data_qualified_table_name(
+            Some(DatabaseType::Postgres),
+            Some("term"),
+            "MSS_CHECK_SALES_ITEM",
+            quote.as_deref()
+        ),
+        "term.\"MSS_CHECK_SALES_ITEM\""
+    );
+    assert_eq!(
+        table_data_qualified_table_name(
+            Some(DatabaseType::Gaussdb),
+            Some("term"),
+            "mss_check_sales_item",
+            quote.as_deref()
+        ),
+        "term.mss_check_sales_item"
+    );
+    // Engines outside the GaussDB/PG identifier-quote path quote both parts.
+    assert_eq!(
+        table_data_qualified_table_name(
+            Some(DatabaseType::Jdbc),
+            Some("term"),
+            "mss_check_sales_item",
+            quote.as_deref()
+        ),
+        "\"term\".\"mss_check_sales_item\""
+    );
 }
