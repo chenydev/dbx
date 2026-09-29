@@ -31,7 +31,7 @@ pub fn visible_connections(
         let access = teams
             .iter()
             .filter(|team| {
-                team.connection_ids.iter().any(|id| *id == connection.id)
+                team.connection_ids.contains(&connection.id)
                     || path.is_some_and(|path| path.ids.iter().any(|id| team.group_ids.contains(id)))
             })
             .map(|team| team.access)
@@ -150,6 +150,7 @@ mod tests {
             connection_ids: connections.iter().map(|id| id.to_string()).collect(),
             group_ids: groups.iter().map(|id| id.to_string()).collect(),
             access,
+            key_prefix: String::new(),
             created_at: 0,
             updated_at: 0,
         }

@@ -90,7 +90,9 @@ API Key ──(n:m)── Team ──┬── connection_ids[]        (直接�
 - demo 模式：`/api/mcp-access/*` 写操作禁止（沿用 demo gate）。
 
 ### 4.3 Key 格式与安全
-- 明文：`dbxk_` + 64 位十六进制（256 bit 随机）；展示前缀 `dbxk_xxxxxxxx`（前 13 字符）。
+- 明文：`<前缀>_` + 64 位十六进制（256 bit 随机）；前缀默认 `dbxk`，可在团队上配置默认前缀（1-24 位字母/数字/`-`/`_`），建 key 时也可单独指定；展示前缀为 `<前缀>_` + 8 位。轮换保留原前缀。
+- 存储：认证只比对 SHA-256；另存一份 AES-256-GCM 信封（`secret_envelope`，AAD 绑定 key id），主密钥复用数据目录的 managed key（`DBX_SECRET_KEY`/`DBX_SECRET_KEY_FILE` 优先），管理页可再次复制。取不到主密钥时退化为只显示一次。早期只存哈希的 key 显示为不可复制，轮换后可复制。
+- 批量：`POST /api/mcp-access/keys/batch`（最多 100 个名称，整批原子写入，key 名称大小写不敏感唯一）；`POST /api/mcp-access/keys/reveal {ids}` 返回明文用于复制（no-store，记审计日志）。复制格式每行 `name key`。
 - 存储：`sha256(明文)` 十六进制；高熵随机 token 不需要 argon2。明文不落盘、不写日志、列表接口不返回。
 - 仍受现有 Web MCP 的 Host / Origin 白名单约束；Web MCP 总开关关闭时所有 Key 都不可用。
 

@@ -22,7 +22,7 @@ use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{delete, get, post, put};
 use axum::Router;
 use dbx_core::connection::AppState;
-use dbx_core::persistence::secret_codec::SecretKeyPolicy;
+use dbx_core::persistence::secret_codec::{SecretCodec, SecretKeyPolicy};
 use dbx_core::sql_dialect::dialect_loader::{register_core_dialects, DialectPluginLoader, DialectRegistry};
 use dbx_core::sql_dialect::hot_reload::DialectHotReload;
 use dbx_core::storage::Storage;
@@ -483,8 +483,19 @@ async fn serve() {
     } else {
         WebMcpRuntime::disabled()
     });
+    // Same data key that protects connection secrets; without it new API
+    // keys still work but can only be copied when they are issued.
+    let mcp_key_codec = match SecretCodec::resolve(SecretKeyPolicy::ManagedDataDir, &data_dir, true) {
+        Ok(resolution) => Some(resolution.codec),
+        Err(error) => {
+            tracing::warn!("MCP API key secrets cannot be stored for copying: {error}");
+            None
+        }
+    };
     let mcp_access = Arc::new(
-        mcp_access::McpAccessStore::load(app_state.storage.clone()).await.expect("Invalid DBX Web MCP access keys"),
+        mcp_access::McpAccessStore::load(app_state.storage.clone(), mcp_key_codec)
+            .await
+            .expect("Invalid DBX Web MCP access keys"),
     );
     let web_state = Arc::new(WebState {
         mcp_access,
@@ -1335,6 +1346,8 @@ async fn serve() {
         .route("/mcp-access/teams", post(routes::mcp_access::create_team))
         .route("/mcp-access/teams/{id}", put(routes::mcp_access::update_team).delete(routes::mcp_access::delete_team))
         .route("/mcp-access/keys", post(routes::mcp_access::create_key))
+        .route("/mcp-access/keys/batch", post(routes::mcp_access::create_keys))
+        .route("/mcp-access/keys/reveal", post(routes::mcp_access::reveal_keys))
         .route("/mcp-access/keys/{id}", put(routes::mcp_access::update_key).delete(routes::mcp_access::delete_key))
         .route("/mcp-access/keys/{id}/rotate", post(routes::mcp_access::rotate_key))
         .route(

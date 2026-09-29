@@ -839,6 +839,8 @@ export interface McpTeam {
   connectionIds: string[];
   groupIds: string[];
   access: McpTeamAccess;
+  /** Default prefix of keys created for this team; empty means `dbxk`. */
+  keyPrefix: string;
   createdAt: number;
   updatedAt: number;
 }
@@ -849,6 +851,7 @@ export interface McpTeamInput {
   connectionIds: string[];
   groupIds: string[];
   access: McpTeamAccess;
+  keyPrefix: string;
 }
 
 export interface McpApiKey {
@@ -862,6 +865,8 @@ export interface McpApiKey {
   createdAt: number;
   updatedAt: number;
   lastUsedAt: number | null;
+  /** False for keys issued before secrets were stored; rotate to copy them. */
+  copyable: boolean;
 }
 
 export interface McpApiKeyInput {
@@ -871,10 +876,26 @@ export interface McpApiKeyInput {
   expiresAt: number | null;
 }
 
+export interface McpApiKeyBatchInput {
+  names: string[];
+  teamIds: string[];
+  enabled: boolean;
+  expiresAt: number | null;
+  /** Overrides the team prefix; empty or null uses the first team prefix, then `dbxk`. */
+  prefix: string | null;
+}
+
 export interface McpIssuedApiKey {
   key: McpApiKey;
-  /** Plain-text key, returned only once by create and rotate. */
+  /** Plain-text key returned by create and rotate. */
   secret: string;
+}
+
+export interface McpRevealedApiKey {
+  id: string;
+  name: string;
+  /** Null when the key was issued before secrets were stored. */
+  secret: string | null;
 }
 
 export interface McpAccessOverview {
@@ -905,6 +926,14 @@ export async function deleteMcpTeam(_id: string): Promise<void> {
 }
 
 export async function createMcpApiKey(_input: McpApiKeyInput): Promise<McpIssuedApiKey> {
+  throw new Error(WEB_ONLY_MCP_ACCESS);
+}
+
+export async function createMcpApiKeys(_input: McpApiKeyBatchInput): Promise<McpIssuedApiKey[]> {
+  throw new Error(WEB_ONLY_MCP_ACCESS);
+}
+
+export async function revealMcpApiKeys(_ids: string[]): Promise<McpRevealedApiKey[]> {
   throw new Error(WEB_ONLY_MCP_ACCESS);
 }
 

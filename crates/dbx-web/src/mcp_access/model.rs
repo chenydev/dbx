@@ -38,12 +38,16 @@ pub struct McpTeam {
     pub group_ids: Vec<String>,
     #[serde(default)]
     pub access: TeamAccess,
+    /// Default prefix for keys created for this team; empty uses `dbxk`.
+    #[serde(default)]
+    pub key_prefix: String,
     pub created_at: i64,
     pub updated_at: i64,
 }
 
-/// Persisted API key. Only the SHA-256 of the secret is stored; the secret
-/// itself is returned once at creation or rotation.
+/// Persisted API key. Authentication matches the SHA-256 of the secret; the
+/// secret itself is kept only as an AES-GCM envelope so admins can copy it
+/// again. Keys created before envelopes existed have none and must be rotated.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct McpApiKeyRecord {
@@ -52,6 +56,8 @@ pub struct McpApiKeyRecord {
     /// Non-secret leading characters shown in the UI to identify the key.
     pub prefix: String,
     pub key_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_envelope: Option<String>,
     #[serde(default)]
     pub team_ids: Vec<String>,
     pub enabled: bool,
@@ -78,7 +84,7 @@ pub struct McpAccessDocument {
     pub keys: Vec<McpApiKeyRecord>,
 }
 
-/// API view of a key: everything except the hash.
+/// API view of a key: no hash and no secret.
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct McpApiKeyView {
@@ -92,6 +98,8 @@ pub struct McpApiKeyView {
     pub created_at: i64,
     pub updated_at: i64,
     pub last_used_at: Option<i64>,
+    /// Whether the secret can be revealed again.
+    pub copyable: bool,
 }
 
 impl McpApiKeyView {
@@ -107,6 +115,7 @@ impl McpApiKeyView {
             created_at: record.created_at,
             updated_at: record.updated_at,
             last_used_at: record.last_used_at,
+            copyable: record.secret_envelope.is_some(),
         }
     }
 }
@@ -123,6 +132,8 @@ pub struct TeamInput {
     pub group_ids: Vec<String>,
     #[serde(default)]
     pub access: TeamAccess,
+    #[serde(default)]
+    pub key_prefix: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -137,6 +148,22 @@ pub struct KeyInput {
     pub expires_at: Option<i64>,
 }
 
+/// Creates one key per name with shared settings. Without `prefix` the first
+/// selected team that defines one is used, then `dbxk`.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeyBatchInput {
+    pub names: Vec<String>,
+    #[serde(default)]
+    pub team_ids: Vec<String>,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub expires_at: Option<i64>,
+    #[serde(default)]
+    pub prefix: Option<String>,
+}
+
 fn default_true() -> bool {
     true
 }
@@ -147,4 +174,13 @@ fn default_true() -> bool {
 pub struct IssuedKey {
     pub key: McpApiKeyView,
     pub secret: String,
+}
+
+/// Secret of an existing key; `None` when the key predates stored envelopes.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RevealedKey {
+    pub id: String,
+    pub name: String,
+    pub secret: Option<String>,
 }

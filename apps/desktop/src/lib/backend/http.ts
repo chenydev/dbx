@@ -2273,6 +2273,14 @@ export async function createMcpApiKey(input: import("@/lib/backend/tauri").McpAp
   return mcpAccessRequest("POST", "/keys", input);
 }
 
+export async function createMcpApiKeys(input: import("@/lib/backend/tauri").McpApiKeyBatchInput): ReturnType<McpAccessTypes["createMcpApiKeys"]> {
+  return mcpAccessRequest("POST", "/keys/batch", input);
+}
+
+export async function revealMcpApiKeys(ids: string[]): ReturnType<McpAccessTypes["revealMcpApiKeys"]> {
+  return mcpAccessRequest("POST", "/keys/reveal", { ids });
+}
+
 export async function updateMcpApiKey(id: string, input: import("@/lib/backend/tauri").McpApiKeyInput): ReturnType<McpAccessTypes["updateMcpApiKey"]> {
   return mcpAccessRequest("PUT", `/keys/${encodeURIComponent(id)}`, input);
 }

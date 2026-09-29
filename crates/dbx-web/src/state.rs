@@ -60,7 +60,8 @@ impl WebState {
     /// Test helper: full field set so new WebState fields don't break scattered test fixtures.
     #[cfg(test)]
     pub fn for_tests(app: Arc<AppState>, data_dir: PathBuf) -> Self {
-        let mcp_access = Arc::new(crate::mcp_access::McpAccessStore::new(app.storage.clone(), Default::default()));
+        let mcp_access =
+            Arc::new(crate::mcp_access::McpAccessStore::new(app.storage.clone(), Default::default(), None));
         Self {
             app,
             data_dir,

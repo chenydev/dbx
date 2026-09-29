@@ -943,6 +943,8 @@ export const createMcpTeam = forward("createMcpTeam");
 export const updateMcpTeam = forward("updateMcpTeam");
 export const deleteMcpTeam = forward("deleteMcpTeam");
 export const createMcpApiKey = forward("createMcpApiKey");
+export const createMcpApiKeys = forward("createMcpApiKeys");
+export const revealMcpApiKeys = forward("revealMcpApiKeys");
 export const updateMcpApiKey = forward("updateMcpApiKey");
 export const rotateMcpApiKey = forward("rotateMcpApiKey");
 export const deleteMcpApiKey = forward("deleteMcpApiKey");
@@ -1021,7 +1023,9 @@ export type {
   McpTeamInput,
   McpApiKey,
   McpApiKeyInput,
+  McpApiKeyBatchInput,
   McpIssuedApiKey,
+  McpRevealedApiKey,
   McpAccessOverview,
   UpdateInfo,
   DownloadedUpdate,

@@ -192,7 +192,24 @@ def main():
     status, _ = fresh.rpc("tools/list")
     check(status == 401, "deleted key is rejected")
 
-    for key in (key_a,):
+    # Batch creation with a team prefix, then copying stored secrets again.
+    api("PUT", f"/api/mcp-access/teams/{ops['id']}", {"name": ops["name"], "connectionIds": ["e2e-ops"], "access": "readWrite", "keyPrefix": "ops"})
+    batch = api("POST", "/api/mcp-access/keys/batch", {"names": ["ops-alice", "ops-bob"], "teamIds": [ops["id"]]})
+    check(len(batch) == 2 and all(item["secret"].startswith("ops_") for item in batch), "batch keys use the team prefix")
+    custom = api("POST", "/api/mcp-access/keys/batch", {"names": ["ops-carol"], "teamIds": [ops["id"]], "prefix": "acme"})
+    check(custom[0]["secret"].startswith("acme_"), "explicit prefix overrides the team prefix")
+    _, text = Mcp(batch[1]["secret"]).initialize().tool("dbx_list_connections")
+    check("e2e-ops" in text and "e2e-sales" not in text, "prefixed batch key is scoped to its team")
+    ids = [item["key"]["id"] for item in batch + custom]
+    revealed = api("POST", "/api/mcp-access/keys/reveal", {"ids": ids})
+    check([item["secret"] for item in revealed] == [item["secret"] for item in batch + custom], "stored secrets can be copied again")
+    try:
+        api("POST", "/api/mcp-access/keys/batch", {"names": ["ops-alice"]})
+        check(False, "duplicate key names are rejected")
+    except urllib.error.HTTPError as error:
+        check(error.code == 400, "duplicate key names are rejected")
+
+    for key in [key_a, *batch, *custom]:
         api("DELETE", f"/api/mcp-access/keys/{key['key']['id']}")
     for team in (sales, ops):
         api("DELETE", f"/api/mcp-access/teams/{team['id']}")

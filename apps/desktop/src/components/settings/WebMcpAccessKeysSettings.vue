@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
+import { computed, nextTick, onMounted, ref } from "vue";
 import { useI18n } from "vue-i18n";
-import { Copy, KeyRound, Loader2, Pencil, Plus, RefreshCcw, RotateCw, Trash2, Users } from "@lucide/vue";
+import { Copy, CopyCheck, KeyRound, Loader2, Pencil, Plus, RefreshCcw, RotateCw, Trash2, Users, X } from "@lucide/vue";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -16,6 +16,10 @@ import { copyToClipboard } from "@/lib/common/clipboard";
 import { useToast } from "@/composables/useToast";
 
 const ACCESS_OPTIONS: McpTeamAccess[] = ["readOnly", "readWrite", "readWriteDangerous"];
+const DEFAULT_KEY_PREFIX = "dbxk";
+// Mirrors `clean_key_prefix` on the server.
+const KEY_PREFIX_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,23}$/;
+const NAME_SEPARATOR = /[\s,，]+/;
 
 const { t } = useI18n();
 const { toast } = useToast();
@@ -34,10 +38,17 @@ const connectionFilter = ref("");
 const keyDialogOpen = ref(false);
 const editingKey = ref<McpApiKey | null>(null);
 const keyForm = ref<McpApiKeyInput>(emptyKey());
+const keyNames = ref<string[]>([]);
+const keyNameDraft = ref("");
+const keyNameInput = ref<HTMLInputElement | null>(null);
+const keyPrefix = ref("");
 const keyExpiresText = ref("");
 const keyFormError = ref("");
 
-const issued = ref<McpIssuedApiKey | null>(null);
+const issued = ref<McpIssuedApiKey[]>([]);
+
+const teamFilter = ref<string[]>([]);
+const selectedKeyIds = ref<string[]>([]);
 
 type PendingAction = { kind: "deleteTeam"; team: McpTeam } | { kind: "deleteKey"; key: McpApiKey } | { kind: "rotateKey"; key: McpApiKey };
 const pending = ref<PendingAction | null>(null);
@@ -54,9 +65,27 @@ const filteredConnections = computed(() => {
   if (!query) return connections;
   return connections.filter((connection) => [connection.name, connection.dbType, ...connection.groupPath].some((value) => value.toLowerCase().includes(query)));
 });
+const filteredKeys = computed(() => {
+  const filter = teamFilter.value;
+  if (!filter.length) return keys.value;
+  return keys.value.filter((key) => key.teamIds.some((teamId) => filter.includes(teamId)));
+});
+const visibleSelectedIds = computed(() => filteredKeys.value.filter((key) => selectedKeyIds.value.includes(key.id)).map((key) => key.id));
+const allVisibleSelected = computed(() => filteredKeys.value.length > 0 && visibleSelectedIds.value.length === filteredKeys.value.length);
+/** Prefix the server picks when none is typed: first selected team that has one. */
+const teamKeyPrefix = computed(() => {
+  for (const teamId of keyForm.value.teamIds) {
+    const prefix = teams.value.find((team) => team.id === teamId)?.keyPrefix;
+    if (prefix) return prefix;
+  }
+  return DEFAULT_KEY_PREFIX;
+});
+const keyPrefixPreview = computed(() => `${normalizePrefix(keyPrefix.value) || teamKeyPrefix.value}_xxxxxxxx…`);
+const issuedSingle = computed(() => (issued.value.length === 1 ? issued.value[0] : null));
+const issuedCopyable = computed(() => issued.value.every((item) => item.key.copyable));
 const issuedConfig = computed(() => {
-  if (!issued.value) return "";
-  return JSON.stringify({ mcpServers: { dbx: { type: "http", url: endpointUrl.value, headers: { Authorization: `Bearer ${issued.value.secret}` } } } }, null, 2);
+  if (!issuedSingle.value) return "";
+  return JSON.stringify({ mcpServers: { dbx: { type: "http", url: endpointUrl.value, headers: { Authorization: `Bearer ${issuedSingle.value.secret}` } } } }, null, 2);
 });
 const pendingTitle = computed(() => {
   switch (pending.value?.kind) {
@@ -79,7 +108,7 @@ const pendingMessage = computed(() => {
 });
 
 function emptyTeam(): McpTeamInput {
-  return { name: "", description: "", connectionIds: [], groupIds: [], access: "readOnly" };
+  return { name: "", description: "", connectionIds: [], groupIds: [], access: "readOnly", keyPrefix: "" };
 }
 
 function emptyKey(): McpApiKeyInput {
@@ -105,6 +134,20 @@ function toggle(list: string[], id: string): string[] {
   return list.includes(id) ? list.filter((item) => item !== id) : [...list, id];
 }
 
+function normalizePrefix(value: string): string {
+  return value.trim().replace(/_+$/, "");
+}
+
+function prefixError(value: string): string {
+  const prefix = normalizePrefix(value);
+  return prefix && !KEY_PREFIX_PATTERN.test(prefix) ? t("mcpAccess.keyPrefixInvalid") : "";
+}
+
+/** One line per key: `name key`. */
+function keyLines(items: { name: string; secret: string }[]): string {
+  return items.map((item) => `${item.name} ${item.secret}`).join("\n");
+}
+
 function keyStatus(key: McpApiKey): { label: string; variant: "default" | "outline" | "destructive" } {
   if (key.expired) return { label: t("mcpAccess.expired"), variant: "destructive" };
   if (!key.enabled) return { label: t("mcpAccess.disabled"), variant: "outline" };
@@ -121,6 +164,10 @@ async function load() {
   error.value = "";
   try {
     overview.value = await api.loadMcpAccessOverview();
+    const known = new Set(overview.value.keys.map((key) => key.id));
+    selectedKeyIds.value = selectedKeyIds.value.filter((id) => known.has(id));
+    const knownTeams = new Set(overview.value.teams.map((team) => team.id));
+    teamFilter.value = teamFilter.value.filter((id) => knownTeams.has(id));
   } catch (cause) {
     error.value = errorMessage(cause);
   } finally {
@@ -130,7 +177,7 @@ async function load() {
 
 function openTeam(team: McpTeam | null) {
   editingTeam.value = team;
-  teamForm.value = team ? { name: team.name, description: team.description, connectionIds: [...team.connectionIds], groupIds: [...team.groupIds], access: team.access } : emptyTeam();
+  teamForm.value = team ? { name: team.name, description: team.description, connectionIds: [...team.connectionIds], groupIds: [...team.groupIds], access: team.access, keyPrefix: team.keyPrefix } : emptyTeam();
   teamFormError.value = "";
   connectionFilter.value = "";
   teamDialogOpen.value = true;
@@ -141,11 +188,17 @@ async function saveTeam() {
     teamFormError.value = t("mcpAccess.nameRequired");
     return;
   }
+  const invalidPrefix = prefixError(teamForm.value.keyPrefix);
+  if (invalidPrefix) {
+    teamFormError.value = invalidPrefix;
+    return;
+  }
   working.value = true;
   teamFormError.value = "";
   try {
-    if (editingTeam.value) await api.updateMcpTeam(editingTeam.value.id, teamForm.value);
-    else await api.createMcpTeam(teamForm.value);
+    const input = { ...teamForm.value, keyPrefix: normalizePrefix(teamForm.value.keyPrefix) };
+    if (editingTeam.value) await api.updateMcpTeam(editingTeam.value.id, input);
+    else await api.createMcpTeam(input);
     teamDialogOpen.value = false;
     toast(t("mcpAccess.teamSaved"));
     await load();
@@ -159,26 +212,90 @@ async function saveTeam() {
 function openKey(key: McpApiKey | null) {
   editingKey.value = key;
   keyForm.value = key ? { name: key.name, teamIds: [...key.teamIds], enabled: key.enabled, expiresAt: key.expiresAt } : emptyKey();
+  // New keys start with the teams currently filtered on, the usual next step.
+  if (!key) keyForm.value.teamIds = [...teamFilter.value];
+  keyNames.value = [];
+  keyNameDraft.value = "";
+  keyPrefix.value = "";
   keyExpiresText.value = toDateTimeLocal(keyForm.value.expiresAt);
   keyFormError.value = "";
   keyDialogOpen.value = true;
+  if (!key) void nextTick(() => keyNameInput.value?.focus());
+}
+
+/** Moves typed or pasted text into name chips; returns false on a duplicate. */
+function addKeyNames(text: string): boolean {
+  keyFormError.value = "";
+  for (const name of text.split(NAME_SEPARATOR).filter(Boolean)) {
+    const lower = name.toLowerCase();
+    const duplicate = keyNames.value.some((existing) => existing.toLowerCase() === lower) || keys.value.some((key) => key.name.toLowerCase() === lower);
+    if (duplicate) {
+      keyFormError.value = t("mcpAccess.duplicateName", { name });
+      return false;
+    }
+    keyNames.value.push(name.slice(0, 100));
+  }
+  return true;
+}
+
+function commitKeyNameDraft(): boolean {
+  if (!keyNameDraft.value.trim()) return true;
+  const ok = addKeyNames(keyNameDraft.value);
+  if (ok) keyNameDraft.value = "";
+  return ok;
+}
+
+function onKeyNameKeydown(event: KeyboardEvent) {
+  if (event.isComposing) return;
+  if (event.key === " " || event.key === "Enter" || event.key === "," || event.key === "，") {
+    event.preventDefault();
+    commitKeyNameDraft();
+  } else if (event.key === "Backspace" && !keyNameDraft.value && keyNames.value.length) {
+    keyNames.value.pop();
+  }
+}
+
+function onKeyNamePaste(event: ClipboardEvent) {
+  const text = event.clipboardData?.getData("text") ?? "";
+  if (!NAME_SEPARATOR.test(text.trim())) return;
+  event.preventDefault();
+  addKeyNames(`${keyNameDraft.value} ${text}`) && (keyNameDraft.value = "");
 }
 
 async function saveKey() {
-  if (!keyForm.value.name.trim()) {
-    keyFormError.value = t("mcpAccess.nameRequired");
-    return;
-  }
   const expiresAt = keyExpiresText.value ? new Date(keyExpiresText.value).getTime() : null;
-  const input: McpApiKeyInput = { ...keyForm.value, expiresAt: Number.isNaN(expiresAt) ? null : expiresAt };
+  const normalizedExpiry = expiresAt === null || Number.isNaN(expiresAt) ? null : expiresAt;
+  if (editingKey.value) {
+    if (!keyForm.value.name.trim()) {
+      keyFormError.value = t("mcpAccess.nameRequired");
+      return;
+    }
+  } else {
+    if (!commitKeyNameDraft()) return;
+    if (!keyNames.value.length) {
+      keyFormError.value = t("mcpAccess.nameRequired");
+      return;
+    }
+    const invalidPrefix = prefixError(keyPrefix.value);
+    if (invalidPrefix) {
+      keyFormError.value = invalidPrefix;
+      return;
+    }
+  }
   working.value = true;
   keyFormError.value = "";
   try {
     if (editingKey.value) {
-      await api.updateMcpApiKey(editingKey.value.id, input);
+      await api.updateMcpApiKey(editingKey.value.id, { ...keyForm.value, expiresAt: normalizedExpiry });
       toast(t("mcpAccess.keySaved"));
     } else {
-      issued.value = await api.createMcpApiKey(input);
+      issued.value = await api.createMcpApiKeys({
+        names: keyNames.value,
+        teamIds: keyForm.value.teamIds,
+        enabled: keyForm.value.enabled,
+        expiresAt: normalizedExpiry,
+        prefix: normalizePrefix(keyPrefix.value) || null,
+      });
     }
     keyDialogOpen.value = false;
     await load();
@@ -213,7 +330,7 @@ async function confirmPending() {
       await api.deleteMcpApiKey(action.key.id);
       toast(t("mcpAccess.keyDeleted"));
     } else {
-      issued.value = await api.rotateMcpApiKey(action.key.id);
+      issued.value = [await api.rotateMcpApiKey(action.key.id)];
     }
     pending.value = null;
     await load();
@@ -227,6 +344,32 @@ async function confirmPending() {
 async function copy(value: string) {
   await copyToClipboard(value);
   toast(t("mcpAccess.copied"));
+}
+
+/** Copies stored keys as `name key` lines; single keys copy the bare secret. */
+async function copyStoredKeys(ids: string[], asLines: boolean) {
+  if (!ids.length) return;
+  working.value = true;
+  try {
+    const revealed = await api.revealMcpApiKeys(ids);
+    const available = revealed.filter((item): item is { id: string; name: string; secret: string } => Boolean(item.secret));
+    const skipped = revealed.length - available.length;
+    if (!available.length) {
+      toast(t("mcpAccess.notCopyable"), 5000);
+      return;
+    }
+    await copyToClipboard(asLines ? keyLines(available) : available[0].secret);
+    toast(skipped ? t("mcpAccess.copiedSkipped", { count: available.length, skipped }) : t("mcpAccess.copiedKeys", { count: available.length }), skipped ? 5000 : undefined);
+  } catch (cause) {
+    toast(errorMessage(cause), 5000);
+  } finally {
+    working.value = false;
+  }
+}
+
+function toggleAllVisible() {
+  const visible = filteredKeys.value.map((key) => key.id);
+  selectedKeyIds.value = allVisibleSelected.value ? selectedKeyIds.value.filter((id) => !visible.includes(id)) : [...new Set([...selectedKeyIds.value, ...visible])];
 }
 
 onMounted(load);
@@ -281,6 +424,7 @@ onMounted(load);
                 <td class="px-3 py-2">
                   <div class="font-medium">{{ team.name }}</div>
                   <div v-if="team.description" class="max-w-56 truncate text-muted-foreground" :title="team.description">{{ team.description }}</div>
+                  <div v-if="team.keyPrefix" class="font-mono text-muted-foreground" :title="t('mcpAccess.keyPrefix')">{{ team.keyPrefix }}_…</div>
                 </td>
                 <td class="max-w-72 px-3 py-2">
                   <div class="text-muted-foreground">{{ t("mcpAccess.connectionCount", { count: team.connectionIds.length }) }} · {{ t("mcpAccess.groupCount", { count: team.groupIds.length }) }}</div>
@@ -313,10 +457,28 @@ onMounted(load);
           </div>
           <Button size="sm" :disabled="working" @click="openKey(null)"><Plus class="mr-1 h-3.5 w-3.5" />{{ t("mcpAccess.createKey") }}</Button>
         </div>
+        <div v-if="teams.length" class="flex flex-wrap items-center gap-1.5 text-xs" data-testid="mcp-key-team-filter">
+          <span class="mr-1 text-muted-foreground">{{ t("mcpAccess.filterTeams") }}</span>
+          <button type="button" class="rounded-full border px-2.5 py-0.5 transition-colors" :class="teamFilter.length ? 'hover:bg-muted' : 'border-primary bg-primary text-primary-foreground'" @click="teamFilter = []">
+            {{ t("mcpAccess.allTeams") }}
+          </button>
+          <button v-for="team in teams" :key="team.id" type="button" class="rounded-full border px-2.5 py-0.5 transition-colors" :class="teamFilter.includes(team.id) ? 'border-primary bg-primary text-primary-foreground' : 'hover:bg-muted'" @click="teamFilter = toggle(teamFilter, team.id)">
+            {{ team.name }}
+          </button>
+        </div>
+        <div v-if="visibleSelectedIds.length" class="flex flex-wrap items-center gap-2 rounded-md border bg-muted/50 px-3 py-1.5 text-xs">
+          <span>{{ t("mcpAccess.selectedCount", { count: visibleSelectedIds.length }) }}</span>
+          <Button size="xs" :disabled="working" data-testid="mcp-copy-selected" @click="copyStoredKeys(visibleSelectedIds, true)"><CopyCheck class="mr-1 h-3.5 w-3.5" />{{ t("mcpAccess.copySelected") }}</Button>
+          <Button size="xs" variant="ghost" :disabled="working" @click="selectedKeyIds = []">{{ t("mcpAccess.clearSelection") }}</Button>
+          <span class="ml-auto text-muted-foreground">{{ t("mcpAccess.copyFormat") }}</span>
+        </div>
         <div class="overflow-x-auto rounded-lg border">
           <table class="w-full table-auto text-left text-xs">
             <thead class="bg-muted">
               <tr>
+                <th class="w-px px-3 py-2">
+                  <input type="checkbox" :aria-label="t('mcpAccess.selectAll')" :checked="allVisibleSelected" :indeterminate="visibleSelectedIds.length > 0 && !allVisibleSelected" :disabled="!filteredKeys.length" @change="toggleAllVisible" />
+                </th>
                 <th class="px-3 py-2">{{ t("mcpAccess.name") }}</th>
                 <th class="px-3 py-2">{{ t("mcpAccess.teams") }}</th>
                 <th class="px-3 py-2">{{ t("mcpAccess.status") }}</th>
@@ -326,7 +488,10 @@ onMounted(load);
               </tr>
             </thead>
             <tbody>
-              <tr v-for="key in keys" :key="key.id" class="border-t">
+              <tr v-for="key in filteredKeys" :key="key.id" class="border-t" :class="selectedKeyIds.includes(key.id) ? 'bg-muted/40' : ''">
+                <td class="w-px px-3 py-2">
+                  <input type="checkbox" :aria-label="key.name" :checked="selectedKeyIds.includes(key.id)" @change="selectedKeyIds = toggle(selectedKeyIds, key.id)" />
+                </td>
                 <td class="px-3 py-2">
                   <div class="font-medium">{{ key.name }}</div>
                   <div class="font-mono text-muted-foreground">{{ key.prefix }}…</div>
@@ -345,14 +510,15 @@ onMounted(load);
                 <td class="w-px whitespace-nowrap px-2 py-2">
                   <div class="flex items-center justify-end gap-1">
                     <Switch :model-value="key.enabled" :disabled="working" :title="key.enabled ? t('mcpAccess.disable') : t('mcpAccess.enable')" @update:model-value="(value: boolean) => setKeyEnabled(key, value)" />
+                    <Button size="icon-xs" variant="ghost" :title="key.copyable ? t('mcpAccess.copyKey') : t('mcpAccess.notCopyable')" :disabled="working || !key.copyable" data-testid="mcp-copy-key" @click="copyStoredKeys([key.id], false)"><Copy class="h-3.5 w-3.5" /></Button>
                     <Button size="icon-xs" variant="ghost" :title="t('mcpAccess.editKey')" :disabled="working" @click="openKey(key)"><Pencil class="h-3.5 w-3.5" /></Button>
                     <Button size="icon-xs" variant="ghost" :title="t('mcpAccess.rotate')" :disabled="working" @click="pending = { kind: 'rotateKey', key }"><RotateCw class="h-3.5 w-3.5" /></Button>
                     <Button size="icon-xs" variant="ghost" class="text-destructive" :title="t('mcpAccess.delete')" :disabled="working" @click="pending = { kind: 'deleteKey', key }"><Trash2 class="h-3.5 w-3.5" /></Button>
                   </div>
                 </td>
               </tr>
-              <tr v-if="!keys.length">
-                <td colspan="6" class="p-6 text-center text-muted-foreground">{{ t("mcpAccess.noKeys") }}</td>
+              <tr v-if="!filteredKeys.length">
+                <td colspan="7" class="p-6 text-center text-muted-foreground">{{ keys.length ? t("mcpAccess.noKeysMatch") : t("mcpAccess.noKeys") }}</td>
               </tr>
             </tbody>
           </table>
@@ -375,6 +541,11 @@ onMounted(load);
           <label class="grid gap-1">
             <span class="font-medium">{{ t("mcpAccess.descriptionLabel") }}</span>
             <Input v-model="teamForm.description" maxlength="500" />
+          </label>
+          <label class="grid gap-1">
+            <span class="font-medium">{{ t("mcpAccess.keyPrefix") }}</span>
+            <Input v-model="teamForm.keyPrefix" class="w-64 font-mono" maxlength="24" placeholder="dbxk" />
+            <span class="text-[11px] text-muted-foreground">{{ t("mcpAccess.teamKeyPrefixHelp", { example: `${normalizePrefix(teamForm.keyPrefix) || "dbxk"}_xxxxxxxx…` }) }}</span>
           </label>
           <div class="grid gap-1">
             <span class="font-medium">{{ t("mcpAccess.access") }}</span>
@@ -432,22 +603,44 @@ onMounted(load);
         </DialogHeader>
         <ErrorBanner v-if="keyFormError" :message="keyFormError" />
         <div class="grid max-h-[62vh] gap-4 overflow-y-auto pr-1 text-xs">
-          <label class="grid gap-1">
+          <label v-if="editingKey" class="grid gap-1">
             <span class="font-medium">{{ t("mcpAccess.name") }}</span>
             <Input v-model="keyForm.name" maxlength="100" />
           </label>
+          <div v-else class="grid gap-1">
+            <div class="flex items-center justify-between gap-2">
+              <span class="font-medium">{{ t("mcpAccess.keyNames") }}</span>
+              <span class="text-muted-foreground">{{ t("mcpAccess.selectedCount", { count: keyNames.length }) }}</span>
+            </div>
+            <div class="flex min-h-9 cursor-text flex-wrap items-center gap-1 rounded-md border bg-background px-2 py-1 focus-within:ring-1 focus-within:ring-ring" data-testid="mcp-key-names" @click="keyNameInput?.focus()">
+              <span v-for="(name, index) in keyNames" :key="name" class="inline-flex items-center gap-0.5 rounded-full bg-primary/10 py-0.5 pl-2 pr-1 text-primary">
+                {{ name }}
+                <button type="button" class="rounded-full p-0.5 hover:bg-primary/20" :aria-label="t('mcpAccess.delete')" @click.stop="keyNames.splice(index, 1)"><X class="h-3 w-3" /></button>
+              </span>
+              <input ref="keyNameInput" v-model="keyNameDraft" class="min-w-32 flex-1 bg-transparent py-0.5 outline-none" maxlength="100" :placeholder="keyNames.length ? '' : t('mcpAccess.keyNamesPlaceholder')" @keydown="onKeyNameKeydown" @paste="onKeyNamePaste" @blur="commitKeyNameDraft" />
+            </div>
+            <span class="text-[11px] text-muted-foreground">{{ t("mcpAccess.keyNamesHelp") }}</span>
+          </div>
           <div class="grid gap-1">
             <span class="font-medium">{{ t("mcpAccess.teams") }}</span>
             <div class="max-h-40 overflow-y-auto rounded-md border p-1">
               <label v-for="team in teams" :key="team.id" class="flex cursor-pointer items-center gap-2 rounded px-2 py-1 hover:bg-muted">
                 <input type="checkbox" :checked="keyForm.teamIds.includes(team.id)" @change="keyForm.teamIds = toggle(keyForm.teamIds, team.id)" />
                 <span class="truncate">{{ team.name }}</span>
+                <span v-if="team.keyPrefix" class="shrink-0 font-mono text-muted-foreground">{{ team.keyPrefix }}_</span>
                 <span class="ml-auto shrink-0 text-muted-foreground">{{ t(`mcpAccess.accessOptions.${team.access}`) }}</span>
               </label>
               <p v-if="!teams.length" class="px-2 py-3 text-center text-muted-foreground">{{ t("mcpAccess.noTeams") }}</p>
             </div>
             <span class="text-[11px] text-muted-foreground">{{ t("mcpAccess.keyTeamsHelp") }}</span>
           </div>
+          <label v-if="!editingKey" class="grid gap-1">
+            <span class="font-medium">{{ t("mcpAccess.keyPrefix") }}</span>
+            <Input v-model="keyPrefix" class="w-64 font-mono" maxlength="24" :placeholder="teamKeyPrefix" data-testid="mcp-key-prefix" />
+            <span class="text-[11px] text-muted-foreground"
+              >{{ t("mcpAccess.keyPrefixHelp") }} <code class="font-mono">{{ keyPrefixPreview }}</code></span
+            >
+          </label>
           <div class="grid gap-1">
             <span class="font-medium">{{ t("mcpAccess.expiresAt") }}</span>
             <div class="flex gap-2">
@@ -463,24 +656,34 @@ onMounted(load);
         </div>
         <DialogFooter>
           <Button variant="outline" :disabled="working" @click="keyDialogOpen = false">{{ t("mcpAccess.cancel") }}</Button>
-          <Button :disabled="working" @click="saveKey"><Loader2 v-if="working" class="mr-1 h-3.5 w-3.5 animate-spin" />{{ t("mcpAccess.save") }}</Button>
+          <Button :disabled="working" data-testid="mcp-save-key" @click="saveKey">
+            <Loader2 v-if="working" class="mr-1 h-3.5 w-3.5 animate-spin" />
+            {{ editingKey || keyNames.length <= 1 ? t("mcpAccess.save") : t("mcpAccess.createKeysCount", { count: keyNames.length }) }}
+          </Button>
         </DialogFooter>
       </DialogContent>
     </Dialog>
 
-    <!-- One-time secret -->
-    <Dialog :open="Boolean(issued)" @update:open="(open: boolean) => !open && (issued = null)">
-      <DialogContent class="max-w-xl">
+    <!-- Issued secrets -->
+    <Dialog :open="issued.length > 0" @update:open="(open: boolean) => !open && (issued = [])">
+      <DialogContent class="max-w-2xl">
         <DialogHeader>
-          <DialogTitle>{{ t("mcpAccess.secretTitle") }}</DialogTitle>
-          <DialogDescription class="text-amber-700 dark:text-amber-300">{{ t("mcpAccess.secretWarning") }}</DialogDescription>
+          <DialogTitle>{{ t("mcpAccess.secretTitle", { count: issued.length }, issued.length) }}</DialogTitle>
+          <DialogDescription :class="issuedCopyable ? '' : 'text-amber-700 dark:text-amber-300'">{{ issuedCopyable ? t("mcpAccess.secretStoredHint") : t("mcpAccess.secretWarning") }}</DialogDescription>
         </DialogHeader>
-        <div v-if="issued" class="grid gap-3 text-xs">
-          <div class="flex min-w-0 items-center gap-2">
-            <code data-testid="mcp-issued-secret" class="min-w-0 flex-1 overflow-x-auto rounded border bg-background px-2 py-1.5">{{ issued.secret }}</code>
-            <Button variant="outline" size="icon" :title="t('mcpAccess.copy')" @click="copy(issued.secret)"><Copy class="h-3.5 w-3.5" /></Button>
+        <div class="grid gap-3 text-xs">
+          <div class="flex items-center justify-between gap-2">
+            <span class="text-muted-foreground">{{ t("mcpAccess.copyFormat") }}</span>
+            <Button size="sm" variant="outline" data-testid="mcp-copy-all" @click="copy(keyLines(issued.map((item) => ({ name: item.key.name, secret: item.secret }))))"> <CopyCheck class="mr-1 h-3.5 w-3.5" />{{ t("mcpAccess.copyAll") }} </Button>
           </div>
-          <div class="grid gap-1">
+          <div class="max-h-72 overflow-y-auto rounded-md border">
+            <div v-for="item in issued" :key="item.key.id" class="flex min-w-0 items-center gap-2 border-b px-2 py-1.5 last:border-b-0">
+              <span class="w-28 shrink-0 truncate font-medium" :title="item.key.name">{{ item.key.name }}</span>
+              <code data-testid="mcp-issued-secret" class="min-w-0 flex-1 overflow-x-auto whitespace-nowrap rounded bg-muted px-2 py-1">{{ item.secret }}</code>
+              <Button variant="ghost" size="icon-xs" :title="t('mcpAccess.copy')" @click="copy(item.secret)"><Copy class="h-3.5 w-3.5" /></Button>
+            </div>
+          </div>
+          <div v-if="issuedSingle" class="grid gap-1">
             <div class="flex items-center justify-between">
               <span class="font-medium">{{ t("mcpAccess.clientConfig") }}</span>
               <Button variant="ghost" size="icon-xs" :title="t('mcpAccess.copy')" @click="copy(issuedConfig)"><Copy class="h-3.5 w-3.5" /></Button>
@@ -489,7 +692,7 @@ onMounted(load);
           </div>
         </div>
         <DialogFooter>
-          <Button @click="issued = null">{{ t("mcpAccess.close") }}</Button>
+          <Button @click="issued = []">{{ t("mcpAccess.close") }}</Button>
         </DialogFooter>
       </DialogContent>
     </Dialog>

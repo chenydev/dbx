@@ -4,10 +4,11 @@ use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::error::AppError;
-use crate::mcp_access::model::{IssuedKey, KeyInput, McpApiKeyView, McpTeam, TeamInput};
+use crate::mcp_access::model::{IssuedKey, KeyBatchInput, KeyInput, McpApiKeyView, McpTeam, TeamInput};
+use crate::mcp_access::MAX_BATCH_KEYS;
 use crate::routes::app_settings::ensure_web_mcp_management_allowed;
 use crate::state::WebState;
 
@@ -139,6 +140,38 @@ pub async fn create_key(
     ensure_web_mcp_management_allowed(&state, &headers).await?;
     let issued: IssuedKey = state.mcp_access.create_key(input).await.map_err(AppError::bad_request)?;
     Ok(no_store(issued))
+}
+
+pub async fn create_keys(
+    State(state): State<Arc<WebState>>,
+    headers: HeaderMap,
+    Json(input): Json<KeyBatchInput>,
+) -> Result<impl IntoResponse, AppError> {
+    ensure_web_mcp_management_allowed(&state, &headers).await?;
+    let issued = state.mcp_access.create_keys(input).await.map_err(AppError::bad_request)?;
+    tracing::info!(count = issued.len(), "Web MCP API keys created");
+    Ok(no_store(issued))
+}
+
+#[derive(Deserialize)]
+pub struct RevealKeysInput {
+    pub ids: Vec<String>,
+}
+
+/// Returns stored secrets for copying. POST keeps the ids out of URLs and
+/// access logs; the response is never cached.
+pub async fn reveal_keys(
+    State(state): State<Arc<WebState>>,
+    headers: HeaderMap,
+    Json(input): Json<RevealKeysInput>,
+) -> Result<impl IntoResponse, AppError> {
+    ensure_web_mcp_management_allowed(&state, &headers).await?;
+    if input.ids.is_empty() || input.ids.len() > MAX_BATCH_KEYS * 10 {
+        return Err(AppError::bad_request("Select between 1 and 1000 API keys"));
+    }
+    let revealed = state.mcp_access.reveal_secrets(&input.ids).map_err(AppError::bad_request)?;
+    tracing::info!(count = revealed.len(), "Web MCP API key secrets revealed");
+    Ok(no_store(revealed))
 }
 
 pub async fn update_key(
