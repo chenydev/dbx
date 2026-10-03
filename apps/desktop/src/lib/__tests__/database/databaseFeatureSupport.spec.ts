@@ -11,6 +11,7 @@ import {
   supportsDatabaseNameCompletion,
   supportsDatabaseSchemaQualifier,
   supportsDatabaseSearch,
+  supportsFieldLineage,
   supportsObjectBrowser,
   supportsObjectBrowserTreeNode,
   supportsQueryExecution,
@@ -19,6 +20,7 @@ import {
   supportsSqlInListPaste,
   supportsTableImport,
   supportsTableVacuum,
+  supportsTransfer,
   supportsTransaction,
   usesOracleStickyTransactionState,
   usesProvenReadOnlyStickyTransactionState,
@@ -143,19 +145,19 @@ describe("zookeeper query capabilities", () => {
 });
 
 describe("database and schema qualifiers", () => {
-  it.each(["sqlserver", "trino", "prestosql"] as const)("supports three-part object names for %s", (databaseType) => {
+  it.each(["sqlserver", "trino", "prestosql", "snowflake"] as const)("supports three-part object names for %s", (databaseType) => {
     expect(supportsDatabaseSchemaQualifier(databaseType)).toBe(true);
   });
 
-  it.each(["mysql", "postgres", "oracle", "snowflake"] as const)("does not widen unverified three-part completion for %s", (databaseType) => {
+  it.each(["mysql", "postgres", "oracle"] as const)("does not widen unverified three-part completion for %s", (databaseType) => {
     expect(supportsDatabaseSchemaQualifier(databaseType)).toBe(false);
   });
 
-  it.each(["mysql", "sqlite", "sqlserver"] as const)("suggests database names for %s", (databaseType) => {
+  it.each(["mysql", "sqlite", "sqlserver", "snowflake"] as const)("suggests database names for %s", (databaseType) => {
     expect(supportsDatabaseNameCompletion(databaseType)).toBe(true);
   });
 
-  it.each(["postgres", "oracle", "snowflake", "trino", "prestosql"] as const)("does not add database name completion for %s", (databaseType) => {
+  it.each(["postgres", "oracle", "trino", "prestosql"] as const)("does not add database name completion for %s", (databaseType) => {
     expect(supportsDatabaseNameCompletion(databaseType)).toBe(false);
   });
 });
@@ -323,12 +325,30 @@ describe("supportsTableVacuum", () => {
 });
 
 describe("supportsTableImport", () => {
+  it("enables DB2 table import", () => {
+    expect(supportsTableImport("db2")).toBe(true);
+  });
+
   it("enables OceanBase Oracle table import", () => {
     expect(supportsTableImport("oceanbase-oracle")).toBe(true);
   });
 
   it("keeps Xugu table import available", () => {
     expect(supportsTableImport("xugu")).toBe(true);
+  });
+});
+
+describe("supportsFieldLineage", () => {
+  it("enables DB2 field lineage", () => {
+    expect(supportsFieldLineage("db2")).toBe(true);
+  });
+});
+
+describe("DB2 transfer and namespace capabilities", () => {
+  it("enables table transfers without enabling database lifecycle operations", () => {
+    expect(supportsTransfer("db2")).toBe(true);
+    expect(connectionNamespaceCreationTarget({ db_type: "db2" })).toBeNull();
+    expect(databaseNodeNamespaceCreationTarget({ db_type: "db2" }, { type: "database", database: "SAMPLE" })).toBe("schema");
   });
 });
 

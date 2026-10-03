@@ -43,7 +43,6 @@ const emit = defineEmits<
   ContentAreaSurfaceEmits & {
     "focus-group": [groupId: string];
     "activate-tab": [tabId: string];
-    "locate-tab": [tab: QueryTab];
     "toggle-zen-mode": [];
     "start-resize": [event: PointerEvent];
     "toggle-collapse": [];
@@ -72,6 +71,7 @@ const activeSurfaceRef = ref<QueryEditorSurfaceHandle | null>(null);
 
 defineExpose({
   focusSearch: (target: Element | null = null) => activeSurfaceRef.value?.focusSearch(target) ?? false,
+  focusWhere: () => activeSurfaceRef.value?.focusWhere() ?? false,
   openGoToColumn: () => activeSurfaceRef.value?.openGoToColumn() ?? false,
   refreshData: () => activeSurfaceRef.value?.refreshData() ?? false,
   toggleResultsPane: () => activeSurfaceRef.value?.toggleResultsPane() ?? false,

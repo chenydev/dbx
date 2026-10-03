@@ -38,6 +38,30 @@ describe("Transwarp driver installation", () => {
   });
 });
 
+describe("NebulaGraph driver installation", () => {
+  it("routes the v3 profile and legacy connections to the same Agent package", () => {
+    for (const profile of [undefined, "nebula", "nebula-v3"]) {
+      expect(agentDriverInstallKey("nebula", profile)).toBe("nebula");
+      expect(showAgentDriverInstallHint("nebula", [{ db_type: "nebula", installed: true }], profile)).toBe(false);
+    }
+  });
+});
+
+describe("Oracle driver installation", () => {
+  it("routes the OCI profile to the dedicated oracle-oci agent", () => {
+    expect(agentDriverInstallKey("oracle", "oci")).toBe("oracle-oci");
+    expect(showAgentDriverInstallHint("oracle", [], "oci")).toBe(true);
+    expect(showAgentDriverInstallHint("oracle", [{ db_type: "oracle-oci", installed: true }], "oci")).toBe(false);
+  });
+
+  it("keeps plain Oracle connections on the thin agent", () => {
+    for (const profile of [undefined, "oracle"]) {
+      expect(agentDriverInstallKey("oracle", profile)).toBe("oracle");
+      expect(showAgentDriverInstallHint("oracle", [{ db_type: "oracle", installed: true }], profile)).toBe(false);
+    }
+  });
+});
+
 describe("shouldApplyDriverStoreFocus", () => {
   it("applies when the driver first appears after a list load", () => {
     expect(shouldApplyDriverStoreFocus(null, "driver:mysql", false)).toBe(true);

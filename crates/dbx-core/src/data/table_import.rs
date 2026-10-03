@@ -5,6 +5,7 @@ use std::io::{BufRead, BufReader, Read as IoRead, Seek, SeekFrom, Write as IoWri
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use calamine::{
@@ -211,6 +212,7 @@ impl TableImportTextEncoding {
 #[serde(rename_all = "camelCase")]
 pub struct TableImportParseOptions {
     pub delimiter: Option<String>,
+    pub decimal_separator: Option<String>,
     pub encoding: Option<TableImportTextEncoding>,
     pub has_header: Option<bool>,
     pub title_row: Option<usize>,
@@ -234,6 +236,7 @@ impl Default for TableImportParseOptions {
     fn default() -> Self {
         Self {
             delimiter: None,
+            decimal_separator: None,
             encoding: Some(TableImportTextEncoding::Auto),
             has_header: None,
             title_row: None,
@@ -669,6 +672,7 @@ fn unique_import_headers(headers: impl IntoIterator<Item = String>) -> Vec<Strin
 #[derive(Debug, Clone)]
 pub struct DelimitedParseConfig {
     pub delimiter: u8,
+    pub decimal_separator: char,
     pub trim_values: bool,
     pub empty_string_as_null: bool,
     /// 命中的字段按 NULL 处理；`None` 表示不按字面量识别 NULL。
@@ -735,9 +739,15 @@ pub fn effective_delimited_config(
     };
 
     let null_literal = effective_delimited_null_literal(options.null_literal.as_deref());
+    let decimal_separator = match options.decimal_separator.as_deref() {
+        None | Some(".") => '.',
+        Some(",") => ',',
+        _ => return Err("Decimal separator must be '.' or ','".to_string()),
+    };
 
     Ok(DelimitedParseConfig {
         delimiter,
+        decimal_separator,
         trim_values: options.trim_values.unwrap_or(false),
         // 配了 NULL 字面量时空字段一律是空串：否则字面量刚把 NULL 和空串分开，
         // 这里又会把空串重新当成 NULL。
@@ -776,7 +786,16 @@ pub fn csv_value_with_config(value: &str, config: &DelimitedParseConfig) -> serd
     if config.empty_string_as_null && value.is_empty() {
         serde_json::Value::Null
     } else {
-        serde_json::Value::String(value.to_string())
+        static COMMA_DECIMAL: OnceLock<regex::Regex> = OnceLock::new();
+        let is_comma_decimal = config.decimal_separator == ','
+            && value.contains(',')
+            && COMMA_DECIMAL
+                .get_or_init(|| {
+                    regex::Regex::new(r"^[+-]?(?:[0-9]+(?:,[0-9]*)?|,[0-9]+)(?:[eE][+-]?[0-9]+)?$").unwrap()
+                })
+                .is_match(value);
+        let normalized = if is_comma_decimal { value.replace(',', ".") } else { value.to_string() };
+        serde_json::Value::String(normalized)
     }
 }
 
@@ -785,6 +804,7 @@ pub fn csv_value(value: &str) -> serde_json::Value {
         value,
         &DelimitedParseConfig {
             delimiter: b',',
+            decimal_separator: '.',
             trim_values: false,
             empty_string_as_null: true,
             null_literal: None,
@@ -2189,7 +2209,7 @@ impl SqlImportRowStream {
         .await?;
         Ok(Self {
             decoder,
-            splitter: Some(StreamingSqlFileSplitter::new(options.sql_dialect, parsing_options)),
+            splitter: Some(StreamingSqlFileSplitter::new(options.sql_dialect, parsing_options, false)),
             family,
             target: None,
             rows: Vec::new(),
@@ -5211,7 +5231,7 @@ fn infer_column_type(rows: &[Vec<serde_json::Value>], source_index: usize) -> Im
 fn text_data_type(db_type: &DatabaseType) -> &'static str {
     match db_type {
         DatabaseType::SqlServer => "NVARCHAR(MAX)",
-        DatabaseType::Oracle | DatabaseType::OceanbaseOracle | DatabaseType::Dameng => "CLOB",
+        DatabaseType::Oracle | DatabaseType::OceanbaseOracle | DatabaseType::Dameng | DatabaseType::Db2 => "CLOB",
         DatabaseType::ClickHouse => "String",
         DatabaseType::Hive
         | DatabaseType::Transwarp
@@ -9220,6 +9240,7 @@ mod tests {
             column_comments: vec![],
             rows: vec![vec![serde_json::json!(""), serde_json::Value::Null]],
             numeric_column_right_align: false,
+            auto_filter: None,
         }])
         .unwrap();
         std::fs::write(&path, workbook).unwrap();
@@ -9869,6 +9890,82 @@ mod tests {
     }
 
     #[test]
+    fn comma_decimal_separator_matches_preview_and_streamed_rows() {
+        let huge = format!("{},25", "9".repeat(400));
+        let bytes = format!("amount;note\n12,50;part,number\n-0,25;\\N\n1,2e3;\n1.234,50;plain\n{huge};large\n");
+        let path = std::env::temp_dir().join(format!("dbx-comma-decimal-{}.csv", uuid::Uuid::new_v4()));
+        std::fs::write(&path, &bytes).unwrap();
+        let options = TableImportParseOptions {
+            delimiter: Some(";".into()),
+            decimal_separator: Some(",".into()),
+            encoding: Some(TableImportTextEncoding::Utf8),
+            ..TableImportParseOptions::default()
+        };
+        let preview =
+            parse_delimited_bytes_with_options(bytes.as_bytes(), TableImportSourceFormat::Delimited, &options, 10)
+                .unwrap();
+        assert_eq!(
+            preview.rows,
+            vec![
+                vec![serde_json::json!("12.50"), serde_json::json!("part,number")],
+                vec![serde_json::json!("-0.25"), serde_json::Value::Null],
+                vec![serde_json::json!("1.2e3"), serde_json::json!("")],
+                vec![serde_json::json!("1.234,50"), serde_json::json!("plain")],
+                vec![serde_json::json!(huge.replace(',', ".")), serde_json::json!("large")],
+            ]
+        );
+
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(16);
+        stream_delimited_rows_to_channel(
+            &path.to_string_lossy(),
+            TableImportSourceFormat::Delimited,
+            &options,
+            2,
+            sender,
+        )
+        .unwrap();
+        let rows = std::iter::from_fn(|| receiver.blocking_recv())
+            .map(|message| message.unwrap())
+            .filter_map(|message| match message {
+                DelimitedStreamMessage::Rows { rows, .. } => Some(rows),
+                _ => None,
+            })
+            .flatten()
+            .collect::<Vec<_>>();
+        assert_eq!(rows, preview.rows);
+
+        let default = parse_delimited_bytes_with_options(
+            bytes.as_bytes(),
+            TableImportSourceFormat::Delimited,
+            &TableImportParseOptions { delimiter: Some(";".into()), ..TableImportParseOptions::default() },
+            10,
+        )
+        .unwrap();
+        assert_eq!(default.rows[0][0], serde_json::json!("12,50"));
+
+        for (format, bytes) in [
+            (TableImportSourceFormat::Csv, &b"amount,note\n\"12,50\",plain\n"[..]),
+            (TableImportSourceFormat::Tsv, &b"amount\tnote\n12,50\tplain\n"[..]),
+        ] {
+            let parsed = parse_delimited_bytes_with_options(
+                bytes,
+                format,
+                &TableImportParseOptions { decimal_separator: Some(",".into()), ..TableImportParseOptions::default() },
+                10,
+            )
+            .unwrap();
+            assert_eq!(parsed.rows[0], vec![serde_json::json!("12.50"), serde_json::json!("plain")]);
+        }
+        let invalid = effective_delimited_config(
+            TableImportSourceFormat::Csv,
+            &TableImportParseOptions { decimal_separator: Some(";".into()), ..TableImportParseOptions::default() },
+        )
+        .unwrap_err();
+        assert!(invalid.contains("Decimal separator"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn parses_delimited_text_without_header_and_trims_values() {
         let options = TableImportParseOptions {
             delimiter: Some("|".to_string()),
@@ -10472,6 +10569,7 @@ mod tests {
                 column_comments: vec![],
                 rows: vec![vec![serde_json::json!(1)]],
                 numeric_column_right_align: false,
+                auto_filter: None,
             },
             XlsxWorksheetData {
                 sheet_name: Some("Second".to_string()),
@@ -10480,6 +10578,7 @@ mod tests {
                 column_comments: vec![],
                 rows: vec![vec![serde_json::json!("Ada")]],
                 numeric_column_right_align: false,
+                auto_filter: None,
             },
         ])
         .unwrap();
@@ -10518,6 +10617,7 @@ mod tests {
                 column_comments: vec![],
                 rows: vec![vec![serde_json::json!(1)]],
                 numeric_column_right_align: false,
+                auto_filter: None,
             },
             XlsxWorksheetData {
                 sheet_name: Some("Second".to_string()),
@@ -10526,6 +10626,7 @@ mod tests {
                 column_comments: vec![],
                 rows: vec![vec![serde_json::json!("Ada")], vec![serde_json::json!("Grace")]],
                 numeric_column_right_align: false,
+                auto_filter: None,
             },
         ])
         .unwrap();
@@ -10739,6 +10840,7 @@ mod tests {
                 vec![serde_json::json!(2), serde_json::json!("Grace")],
             ],
             numeric_column_right_align: false,
+            auto_filter: None,
         }])
         .unwrap();
         std::fs::write(&path, workbook).unwrap();
@@ -11116,6 +11218,7 @@ mod tests {
                 vec![serde_json::json!("summary"), serde_json::json!(2)],
             ],
             numeric_column_right_align: false,
+            auto_filter: None,
         }])
         .unwrap();
         std::fs::write(&path, workbook).unwrap();
@@ -11720,6 +11823,7 @@ mod tests {
                 vec![serde_json::json!(2), serde_json::json!(2.25)],
             ],
             numeric_column_right_align: false,
+            auto_filter: None,
         }])
         .unwrap();
         std::fs::write(&path, workbook).unwrap();
@@ -11819,6 +11923,7 @@ mod tests {
                 vec![serde_json::json!("summary"), serde_json::json!(2)],
             ],
             numeric_column_right_align: false,
+            auto_filter: None,
         }])
         .unwrap();
         std::fs::write(&path, workbook).unwrap();
@@ -11937,6 +12042,29 @@ mod tests {
         let plan = build_import_create_table_plan(&data, &mappings, "events", "dbo", &DatabaseType::SqlServer).unwrap();
 
         assert_eq!(plan.sql, "CREATE TABLE [dbo].[events] (\n  [notes] NVARCHAR(MAX)\n)");
+    }
+
+    #[test]
+    fn db2_create_table_plan_uses_clob_for_inferred_text() {
+        let data = ParsedImportFile {
+            columns: vec!["id".to_string(), "notes".to_string()],
+            rows: vec![vec![serde_json::json!(1), serde_json::json!("long text")]],
+            total_rows: 1,
+            effective_encoding: None,
+        };
+        let mappings = data
+            .columns
+            .iter()
+            .map(|column| TableImportColumnMapping {
+                source_column: column.clone(),
+                target_column: column.clone(),
+                target_data_type: None,
+            })
+            .collect::<Vec<_>>();
+
+        let plan = build_import_create_table_plan(&data, &mappings, "events", "APP", &DatabaseType::Db2).unwrap();
+
+        assert_eq!(plan.sql, "CREATE TABLE \"APP\".\"events\" (\n  \"id\" BIGINT,\n  \"notes\" CLOB\n)");
     }
 
     #[test]
@@ -12104,6 +12232,50 @@ mod tests {
                 row_count: 1,
             },
         ]);
+    }
+
+    #[test]
+    fn db2_import_uses_schema_qualified_multi_row_insert() {
+        let mappings = vec![
+            TableImportColumnMapping {
+                source_column: "id".to_string(),
+                target_column: "ID".to_string(),
+                target_data_type: None,
+            },
+            TableImportColumnMapping {
+                source_column: "name".to_string(),
+                target_column: "NAME".to_string(),
+                target_data_type: None,
+            },
+        ];
+        let data = ParsedImportFile {
+            columns: vec!["id".to_string(), "name".to_string()],
+            rows: vec![
+                vec![serde_json::json!(1), serde_json::json!("Ada")],
+                vec![serde_json::json!(2), serde_json::json!("Grace")],
+            ],
+            total_rows: 2,
+            effective_encoding: None,
+        };
+
+        let batches = build_import_insert_batches(
+            &data,
+            &mappings,
+            &[("ID".to_string(), "BIGINT".to_string()), ("NAME".to_string(), "VARCHAR(128)".to_string())],
+            "USERS",
+            "APP",
+            &DatabaseType::Db2,
+            500,
+        )
+        .unwrap();
+
+        assert_eq!(
+            batches,
+            vec![ImportSqlBatch {
+                sql: "INSERT INTO \"APP\".\"USERS\" (\"ID\", \"NAME\") VALUES\n(1, 'Ada'),\n(2, 'Grace')".to_string(),
+                row_count: 2,
+            }]
+        );
     }
 
     #[test]

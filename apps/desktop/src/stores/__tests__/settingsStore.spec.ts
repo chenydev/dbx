@@ -20,6 +20,13 @@ import type { AiConfigItem } from "@/types/ai";
 import { DATA_GRID_EXTRACTOR_OPTIONS_MIGRATION_VERSION } from "@/lib/dataGrid/dataGridCopyExtractor";
 
 describe("normalizeEditorSettings", () => {
+  it("preserves comment-first naming for existing settings and permits opting out", () => {
+    expect(DEFAULT_EDITOR_SETTINGS.resultTabPreferComments).toBe(true);
+    expect(normalizeEditorSettings({}).resultTabPreferComments).toBe(true);
+    expect(normalizeEditorSettings({ resultTabPreferComments: false }).resultTabPreferComments).toBe(false);
+    expect(normalizeEditorSettings({ resultTabPreferComments: "false" } as any).resultTabPreferComments).toBe(true);
+  });
+
   it("defaults and sanitizes AI conversation typography independently", () => {
     expect(normalizeEditorSettings({})).toMatchObject({ aiFontFamily: "", aiFontSize: 12 });
     expect(
@@ -66,6 +73,14 @@ describe("normalizeEditorSettings", () => {
     expect(normalizeEditorSettings({ sqlVariableSubstitutionEnabled: false }).sqlVariableSubstitutionEnabled).toBe(false);
     expect(normalizeEditorSettings({ sqlVariableSubstitutionEnabled: "false" } as any).sqlVariableSubstitutionEnabled).toBe(true);
     expect(normalizeEditorSettings({ sqlVariableSubstitutionEnabled: null } as any).sqlVariableSubstitutionEnabled).toBe(true);
+  });
+
+  it("enables source-code SQL restore on paste by default and only preserves booleans", () => {
+    expect(DEFAULT_EDITOR_SETTINGS.restoreSqlFromSourcePasteEnabled).toBe(true);
+    expect(normalizeEditorSettings({}).restoreSqlFromSourcePasteEnabled).toBe(true);
+    expect(normalizeEditorSettings({ restoreSqlFromSourcePasteEnabled: false }).restoreSqlFromSourcePasteEnabled).toBe(false);
+    expect(normalizeEditorSettings({ restoreSqlFromSourcePasteEnabled: "false" } as any).restoreSqlFromSourcePasteEnabled).toBe(true);
+    expect(normalizeEditorSettings({ restoreSqlFromSourcePasteEnabled: null } as any).restoreSqlFromSourcePasteEnabled).toBe(true);
   });
 
   it("keeps the quick filter view by default and preserves fixed filter views", () => {

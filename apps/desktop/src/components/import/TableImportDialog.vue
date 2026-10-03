@@ -135,6 +135,7 @@ const errorMessage = ref("");
 const wizardStep = ref<TableImportWizardStep>("source");
 const fileInput = ref<HTMLInputElement | null>(null);
 const delimiter = ref(",");
+const decimalSeparator = ref<"." | ",">(".");
 const textEncoding = ref<api.TableImportTextEncoding>("auto");
 const titleRow = ref(1);
 const dataStartRow = ref(2);
@@ -397,6 +398,7 @@ function resetState() {
   activeTaskIndex.value = 0;
   sourceFormat.value = "csv";
   delimiter.value = ",";
+  decimalSeparator.value = ".";
   textEncoding.value = "auto";
   titleRow.value = 1;
   dataStartRow.value = 2;
@@ -465,6 +467,7 @@ function taskParseOptions(format: api.TableImportSourceFormat, sheetName = ""): 
   return buildTableImportParseOptions({
     format,
     delimiter: delimiter.value,
+    decimalSeparator: decimalSeparator.value,
     textEncoding: textEncoding.value,
     titleRow: titleRow.value,
     dataStartRow: dataStartRow.value,
@@ -520,7 +523,8 @@ function applyAutoMapping() {
     columnMapping.value = Object.fromEntries(currentPreview.columns.map((source) => [source, source]));
     return;
   }
-  columnMapping.value = autoMapImportColumns(currentPreview.columns, targetColumnNames.value);
+  const headerless = titleRow.value === 0 && (isDelimitedFormat(sourceFormat.value) || sourceFormat.value === "excel");
+  columnMapping.value = autoMapImportColumns(currentPreview.columns, targetColumnNames.value, headerless ? "position" : "name");
 }
 
 function applySuggestedColumnDataTypes(currentPreview = preview.value) {
@@ -1223,7 +1227,7 @@ watch(
 onBeforeUnmount(stopDialogDrag);
 
 watch([sourceFormat, delimiter, titleRow, dataStartRow, lastDataRow, trimValues, emptyStringAsNull, selectedSheet, jsonShape, previewLimit], schedulePreviewReload);
-watch(textEncoding, schedulePreviewReloadAfterEncodingChange);
+watch([textEncoding, decimalSeparator], schedulePreviewReloadAfterEncodingChange);
 watch([newTableName, columnMapping, columnDataTypes], saveActiveBatchTask, { deep: true });
 watch(wizardStep, (step) => {
   if (step !== "mapping") closeDataTypePicker();
@@ -1434,7 +1438,7 @@ watch(rawProgressPercent, (percent) => {
             </div>
           </div>
 
-          <div v-if="sourceFormat === 'csv' || sourceFormat === 'tsv' || sourceFormat === 'delimited'" class="grid grid-cols-5 gap-3 rounded-md border p-3">
+          <div v-if="sourceFormat === 'csv' || sourceFormat === 'tsv' || sourceFormat === 'delimited'" class="grid grid-cols-2 gap-3 rounded-md border p-3 md:grid-cols-3 xl:grid-cols-6">
             <div class="space-y-1.5">
               <Label class="text-xs">{{ t("tableImport.encoding") }}</Label>
               <Select :model-value="textEncoding" @update:model-value="(value: any) => (textEncoding = value)">
@@ -1454,6 +1458,18 @@ watch(rawProgressPercent, (percent) => {
             <div class="space-y-1.5">
               <Label class="text-xs">{{ t("tableImport.delimiter") }}</Label>
               <Input v-model="delimiter" :disabled="sourceFormat !== 'delimited'" class="h-8 text-xs font-mono" />
+            </div>
+            <div class="space-y-1.5">
+              <Label class="text-xs">{{ t("tableImport.decimalSeparator") }}</Label>
+              <Select v-model="decimalSeparator">
+                <SelectTrigger class="h-8 text-xs font-mono" :aria-label="t('tableImport.decimalSeparator')">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value=".">.</SelectItem>
+                  <SelectItem value=",">,</SelectItem>
+                </SelectContent>
+              </Select>
             </div>
             <div class="space-y-1.5">
               <Label class="text-xs">{{ t("tableImport.titleRow") }}</Label>
@@ -1544,10 +1560,10 @@ watch(rawProgressPercent, (percent) => {
 
           <div v-if="supportsImportConflictPolicy" class="space-y-1.5 rounded-md border p-3">
             <Label for="table-import-conflict-policy" class="text-xs">{{ t("tableImport.conflictPolicy") }}</Label>
-            <select id="table-import-conflict-policy" v-model="conflictPolicy" data-testid="table-import-conflict-policy" class="flex h-8 w-full rounded-md border border-input bg-background px-2 text-xs">
-              <option value="error">{{ t("tableImport.conflictError") }}</option>
-              <option value="skip">{{ t("tableImport.skipDuplicateRows") }}</option>
-              <option v-if="targetMode === 'existing'" value="updateExisting" :disabled="!canUpdateExistingRows">
+            <select id="table-import-conflict-policy" v-model="conflictPolicy" data-testid="table-import-conflict-policy" class="flex h-8 w-full rounded-md border border-input bg-background text-foreground px-2 text-xs [color-scheme:light] dark:[color-scheme:dark]">
+              <option value="error" class="bg-popover text-popover-foreground">{{ t("tableImport.conflictError") }}</option>
+              <option value="skip" class="bg-popover text-popover-foreground">{{ t("tableImport.skipDuplicateRows") }}</option>
+              <option v-if="targetMode === 'existing'" value="updateExisting" :disabled="!canUpdateExistingRows" class="bg-popover text-popover-foreground">
                 {{ t("tableImport.updateExistingRows") }}
               </option>
             </select>
@@ -1607,11 +1623,11 @@ watch(rawProgressPercent, (percent) => {
                   <select
                     v-else
                     :value="columnMapping[sourceColumn] || SKIP_VALUE"
-                    class="h-7 w-full min-w-0 rounded-md border bg-background px-2 text-xs font-mono shadow-none hover:bg-muted/30 focus-visible:ring-1 focus-visible:ring-ring/25"
+                    class="h-7 w-full min-w-0 rounded-md border border-input bg-background text-foreground px-2 text-xs font-mono shadow-none hover:bg-muted/30 focus-visible:ring-1 focus-visible:ring-ring/25 [color-scheme:light] dark:[color-scheme:dark]"
                     @change="(e) => updateMapping(sourceColumn, (e.target as HTMLSelectElement).value)"
                   >
-                    <option :value="SKIP_VALUE">{{ t("tableImport.skipColumn") }}</option>
-                    <option v-for="column in targetColumns" :key="column.name" :value="column.name">
+                    <option :value="SKIP_VALUE" class="bg-popover text-popover-foreground">{{ t("tableImport.skipColumn") }}</option>
+                    <option v-for="column in targetColumns" :key="column.name" :value="column.name" class="bg-popover text-popover-foreground">
                       {{ column.name }}
                     </option>
                   </select>

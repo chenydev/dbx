@@ -11,6 +11,8 @@
 // (delivery is same-tick), never a pending undelivered one.
 let lastHandledFormatRequestId = 0;
 let lastHandledCompressRequestId = 0;
+let vimMappingsApplied = false;
+let vimClipboardConfigured = false;
 </script>
 
 <script setup lang="ts">
@@ -55,11 +57,11 @@ import { createColumnReferencePayload, tableReferenceInsertText } from "@/lib/ed
 import { clearRememberedFocusedQueryEditorView, focusedQueryEditorView, queryEditorInsertContext, registerQueryEditorInsertContext, rememberFocusedQueryEditorView, unregisterQueryEditorInsertContext } from "@/lib/editor/focusedQueryEditorView";
 import { loadObjectMetadataFacet } from "@/lib/metadata/objectMetadataCache";
 import { structurePeekPanelId } from "@/lib/editor/structurePeekPanel";
-import { parkEditorNativeSelection, type EditorNativeSelectionPark } from "@/lib/editor/queryEditorNativeSelection";
+import { createQueryEditorNativeSelectionGuard, parkEditorNativeSelection, type EditorNativeSelectionPark } from "@/lib/editor/queryEditorNativeSelection";
 import CodeSnapshotDialog from "@/components/codeSnapshot/CodeSnapshotDialog.vue";
 import QueryEditorContextMenu, { type QueryEditorContextMenuState, type QueryEditorContextMenuActions } from "./QueryEditorContextMenu.vue";
 
-import { clipboardLineEndings, readTextFromClipboard } from "@/lib/common/clipboard";
+import { clipboardLineEndings, copyToClipboard, readTextFromClipboard } from "@/lib/common/clipboard";
 
 import { resolveExecutableSql, type SqlExecutionOverride } from "@/lib/sql/sqlExecutionTarget";
 import { supportsExecutionTargetPicker, type SqlTextRange } from "@/lib/sql/sqlStatementRanges";
@@ -69,6 +71,7 @@ import { looksLikeDmlStatement } from "@/lib/sql/dmlChangePreview";
 
 import { canFormatSqlForDatabaseType, formatSqlForEditing, compressSqlText } from "@/lib/sql/sqlFormatter";
 import { detectAndFormatStructured } from "@/lib/sql/autoFormat";
+import { restoreSqlFromSourcePaste } from "@/lib/sql/sqlSourcePaste";
 import { enabledSqlParameterSyntaxes, resolveSqlVariableSyntaxToggles } from "@/lib/sql/sqlVariableSyntax";
 
 import { createQueryEditorExecutionViewportOwnership, isQueryEditorPositionVisible } from "@/lib/editor/queryEditorExecutionViewport";
@@ -96,6 +99,7 @@ import { createQueryEditorSqlShortcutDomHandler, isCharacterProducingShortcut } 
 import { createQueryEditorReplaceShortcutBindings, createQueryEditorReplaceShortcutHandler, createQueryEditorSearchKeymap } from "@/lib/editor/queryEditorSearchKeymap";
 import { createQueryEditorEscapeHandler } from "@/lib/editor/queryEditorEscape";
 import { buildQueryEditorLineNumbersExtension, createQueryEditorLineNumberAlignmentExtension } from "@/lib/editor/queryEditorLineNumbers";
+import { keepGuttersAttachedDuringSync } from "@/lib/editor/codemirrorGutterSync";
 import { searchKeymapWithoutModD } from "@/lib/editor/codemirrorSearchKeymap";
 import { defaultKeymapForGlobalShortcuts } from "@/lib/editor/codemirrorDefaultKeymap";
 import { createShowWhitespaceExtension } from "@/lib/editor/codemirrorShowWhitespace";
@@ -106,6 +110,8 @@ import { resolveSqlShortcutTableToken } from "@/lib/sql/sqlShortcutTableTarget";
 import { normalizeShortcutSettings, shortcutToCodeMirrorKey } from "@/lib/editor/shortcutRegistry";
 import { trimmedSelectionLayer } from "@/lib/editor/codemirrorTrimmedSelectionLayer";
 import { editorClipboardLineEndingsExtension } from "@/lib/editor/editorClipboardLineEndings";
+import { applyVimConfig, isVimMappingCommand, loadVimConfig } from "@/lib/editor/vimConfig";
+import { configureVimSystemClipboard } from "@/lib/editor/vimSystemClipboard";
 
 import { selectionMatchOccurrences } from "@/lib/editor/codemirrorSelectionMatches";
 
@@ -129,6 +135,7 @@ import { supportsQueryEditorBlockComments, supportsSqlInListPaste } from "@/lib/
 import { queryContextObjectRoute, queryTableCandidateAtSqlPosition, resolveQueryContextCandidateDatabase, resolveQueryContextObjectTarget, type QueryContextObjectAction } from "@/lib/sql/queryCursorTableTarget";
 import * as api from "@/lib/backend/api";
 import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
+import { isMacOS } from "@/lib/backend/platform";
 import { resolveSqlDialectId } from "@/lib/sql/semantic/dialect";
 import type { SqlCompletionColumn, SqlCompletionContext, SqlCompletionReferencedTable } from "@/lib/sql/sqlCompletion";
 
@@ -281,6 +288,7 @@ const {
   copySelectedSqlAsRichTextFromContextMenu,
   cutSelectedSqlFromContextMenu,
   pasteClipboardSqlFromContextMenu,
+  pasteClipboardSqlRestoringSource,
   toggleCommentFromContextMenu,
   toggleBlockCommentFromContextMenu,
   selectAllSqlFromContextMenu,
@@ -538,7 +546,7 @@ const {
 const hoverContent = createQueryEditorHoverContent({ isDark, t, toast });
 const { resolveSqlHoverTooltip } = useQueryEditorHover({ props, contextMenuOpen, settingsStore, connectionStore, metadata: completionMetadata, createHoverDom: hoverContent.createHoverDom, semanticCompletionEnabled: SEMANTIC_SQL_COMPLETION_ENABLED, maxCompletionTables: MAX_COMPLETION_TABLES });
 const pointerInteractions = useQueryEditorPointer({ props, clearTableNavigationHover: () => clearTableNavigationHover(), emit });
-const { registerEditorScrollbarPointerGuard, registerEditorNativeSelectionDragGuard, startEditorSelectionDrag } = pointerInteractions;
+const { registerEditorScrollbarPointerGuard, registerEditorNativeSelectionDragGuard, registerEditorNativeSelectionScrollGuard, startEditorSelectionDrag } = pointerInteractions;
 const tableDrop = useQueryEditorTableDrop({ props, view, editorRef, settingsStore });
 const { hasDroppedTableReference, insertDroppedTableReference, queryEditorDropCaret, queryEditorDropCaretStyle, showQueryEditorDropCaretAt, hideQueryEditorDropCaret, registerTableReferenceDropListener, unregisterTableReferenceDropListener } = tableDrop;
 const objectNavigation = useQueryEditorObjectNavigation({
@@ -1038,6 +1046,34 @@ function resyncCaretAfterPaste(view: EditorViewType) {
   });
 }
 
+/**
+ * 粘贴时尝试把「源码里的字符串拼接 SQL」（Java/JS/Python 等）还原为普通 SQL。
+ * 命中后自行插入并阻止默认粘贴；未命中返回 false，交给原有粘贴流程处理。
+ */
+function tryRestoreSqlFromSourcePaste(event: ClipboardEvent, currentView: EditorViewType): boolean {
+  if (props.readOnly || !settingsStore.editorSettings.restoreSqlFromSourcePasteEnabled) return false;
+  if (currentView.state.selection.ranges.length !== 1) return false;
+  const eventText = event.clipboardData?.getData("text/plain") ?? "";
+  if (!eventText) return false;
+  // Tauri 下超长文本会被 WebView 截断、之后异步补写后半段，这里不参与还原以免破坏片段边界
+  if (shouldRecoverLargeTauriPaste(eventText, isTauriRuntime())) return false;
+
+  const restored = restoreSqlFromSourcePaste(eventText);
+  if (!restored.changed) return false;
+
+  event.preventDefault();
+  const selection = currentView.state.selection.main;
+  const insertedText = normalizeQueryEditorPasteText(restored.sql);
+  currentView.dispatch({
+    changes: { from: selection.from, to: selection.to, insert: insertedText },
+    selection: { anchor: selection.from + insertedText.length },
+    scrollIntoView: true,
+    userEvent: "input.paste",
+  });
+  toast(t("editor.sqlSourcePasteRestored"), 2000);
+  return true;
+}
+
 function recoverLargeTauriPaste(event: ClipboardEvent, currentView: EditorViewType): boolean {
   const eventText = event.clipboardData?.getData("text/plain") ?? "";
   if (props.readOnly || currentView.state.selection.ranges.length !== 1 || !shouldRecoverLargeTauriPaste(eventText, isTauriRuntime())) return false;
@@ -1166,6 +1202,7 @@ const contextMenuActions: QueryEditorContextMenuActions = {
   copySelectedSqlAsRichTextFromContextMenu,
   cutSelectedSqlFromContextMenu,
   pasteClipboardSqlFromContextMenu,
+  pasteClipboardSqlRestoringSource,
   convertSelectedSqlCase,
   convertSelectedNamingStyle,
   openDelimitedListDialog,
@@ -1454,9 +1491,26 @@ function vimModeExtension(enabled = settingsStore.editorSettings.vimModeEnabled)
 function configureDbxVimCommands(vimApi: typeof import("@replit/codemirror-vim").Vim) {
   if (codeMirrorRuntime.dbxVimCommandsConfigured) return;
   codeMirrorRuntime.dbxVimCommandsConfigured = true;
+  if (!vimClipboardConfigured) {
+    configureVimSystemClipboard(vimApi, { readText: readTextFromClipboard, writeText: copyToClipboard });
+    vimClipboardConfigured = true;
+  }
   vimApi.defineEx("write", "w", (cm) => {
     cm.cm6?.contentDOM.dispatchEvent(new CustomEvent(DBX_VIM_SAVE_EVENT, { bubbles: true }));
   });
+}
+
+let vimConfigApplied = false;
+
+function applyVimConfigToCurrentEditor(commands: readonly string[]) {
+  const vimApi = codeMirrorRuntime.codeMirrorVimApi;
+  if (vimConfigApplied || !view.value || !codeMirrorRuntime.codeMirrorGetVimCm || !vimApi) return;
+  const cm = codeMirrorRuntime.codeMirrorGetVimCm(view.value);
+  if (!cm) return;
+  const commandsForEditor = commands.filter((command) => !vimMappingsApplied || !isVimMappingCommand(command));
+  applyVimConfig(commandsForEditor, (command) => vimApi.handleEx(cm as Parameters<typeof vimApi.handleEx>[0], command));
+  vimMappingsApplied = true;
+  vimConfigApplied = true;
 }
 
 async function ensureCodeMirrorVim() {
@@ -1849,6 +1903,7 @@ const codeMirrorLifecycle = useQueryEditorCodeMirror({
     if (initialSettings.vimModeEnabled) {
       await ensureCodeMirrorVim();
     }
+    const vimCommands = initialSettings.vimModeEnabled ? await loadVimConfig() : [];
     const { currentStatementFrameExtension, activeLineHighlighter } = sqlExtensions.createViewDecorations();
     function updateLargeDocumentMode(currentView: EditorViewType) {
       largeDocumentMode.value = shouldUseQueryEditorLargeDocumentModeForSize(currentView.state.doc.length, currentView.state.doc.lines);
@@ -1876,11 +1931,13 @@ const codeMirrorLifecycle = useQueryEditorCodeMirror({
         // keystroke maps the boundary view to the new doc before any lineMarker
         // callback reads it, otherwise the gutter would trigger a full parse.
         statementBoundariesTrackingPlugin,
+        createQueryEditorNativeSelectionGuard(ViewPlugin, { enabled: isTauriRuntime() && isMacOS(), inputHandler: EditorView.inputHandler, finalizeClipboardText: (text) => clipboardLineEndings(text) }),
         initializedRuntime.runGutterComp.of(runStatementGutterExtension()),
         initializedRuntime.lineNumbersComp.of(lineNumbersExtension(initialSettings.showLineNumbers)),
         createQueryEditorLineNumberAlignmentExtension(ViewPlugin),
         currentStatementFrameExtension,
         highlightActiveLineGutter(),
+        keepGuttersAttachedDuringSync(ViewPlugin),
         highlightSpecialChars(),
         initializedRuntime.historyResetComp.of(history()),
         foldGutter({
@@ -2055,6 +2112,7 @@ const codeMirrorLifecycle = useQueryEditorCodeMirror({
         ),
         EditorView.domEventHandlers({
           paste(event, currentView) {
+            if (tryRestoreSqlFromSourcePaste(event, currentView)) return true;
             return recoverLargeTauriPaste(event, currentView);
           },
           dragover(event) {
@@ -2120,6 +2178,7 @@ const codeMirrorLifecycle = useQueryEditorCodeMirror({
       parent: editorElement,
       onReady() {
         if (!view.value) return;
+        if (initialSettings.vimModeEnabled) applyVimConfigToCurrentEditor(vimCommands);
         syncQueryEditorInsertContext(view.value);
         batchSelection.attach(view.value, tooltipParent);
         postCompositionKeyGuardCleanup = postCompositionKeyGuard.attach(view.value.contentDOM);
@@ -2131,6 +2190,10 @@ const codeMirrorLifecycle = useQueryEditorCodeMirror({
         // such a copy happens rather than here, because that is the only moment
         // the normalizer is used.
         registerEditorNativeSelectionDragGuard(view.value, { finalizeClipboardText: (text) => clipboardLineEndings(text) });
+        // The same park, held for the length of a scroll burst: scrolling a
+        // long selection costs macOS 26/27 the same per-run serialization on
+        // every scroll event that a drag pays per pointer move.
+        registerEditorNativeSelectionScrollGuard(view.value, { finalizeClipboardText: (text) => clipboardLineEndings(text) });
         view.value.scrollDOM.addEventListener("scroll", scheduleEditorViewportEmit, {
           passive: true,
         });
@@ -2360,20 +2423,25 @@ watch([() => props.clientSessionId, () => props.completionContextVersion], () =>
   scheduleSemanticDiagnostics();
 });
 
-watch([() => props.databaseType, () => props.dialect, () => props.syntaxDialect, sqlDriverProfile], () => {
-  executableStatementRangeCache = null;
-  statementBoundaries.invalidate();
-  if (!view.value || !codeMirrorRuntime.sqlLanguageComp || !codeMirrorRuntime.buildSqlLanguageExtension || !codeMirrorRuntime.sqlSemanticHighlightComp || !codeMirrorRuntime.buildSqlSemanticHighlightExtension || !codeMirrorRuntime.sqlSignatureComp || !codeMirrorRuntime.buildSqlSignatureExtension)
-    return;
-  // Signature tooltips depend on the external dialect, so refresh them even when the document and selection stay unchanged.
-  view.value.dispatch({
-    effects: [
-      codeMirrorRuntime.sqlLanguageComp.reconfigure(codeMirrorRuntime.buildSqlLanguageExtension()),
-      codeMirrorRuntime.sqlSemanticHighlightComp.reconfigure(codeMirrorRuntime.buildSqlSemanticHighlightExtension()),
-      codeMirrorRuntime.sqlSignatureComp.reconfigure(codeMirrorRuntime.buildSqlSignatureExtension()),
-    ],
-  });
-});
+watch(
+  [() => props.tabId, () => props.databaseType, () => props.dialect, () => props.syntaxDialect, sqlDriverProfile],
+  () => {
+    executableStatementRangeCache = null;
+    statementBoundaries.invalidate();
+    if (!view.value || !codeMirrorRuntime.sqlLanguageComp || !codeMirrorRuntime.buildSqlLanguageExtension || !codeMirrorRuntime.sqlSemanticHighlightComp || !codeMirrorRuntime.buildSqlSemanticHighlightExtension || !codeMirrorRuntime.sqlSignatureComp || !codeMirrorRuntime.buildSqlSignatureExtension)
+      return;
+    // Signature tooltips depend on the external dialect, so refresh them even when the document and selection stay unchanged.
+    view.value.dispatch({
+      effects: [
+        codeMirrorRuntime.sqlLanguageComp.reconfigure(codeMirrorRuntime.buildSqlLanguageExtension()),
+        codeMirrorRuntime.sqlSemanticHighlightComp.reconfigure(codeMirrorRuntime.buildSqlSemanticHighlightExtension()),
+        codeMirrorRuntime.sqlSignatureComp.reconfigure(codeMirrorRuntime.buildSqlSignatureExtension()),
+      ],
+    });
+    applyEditorCompletionExtension();
+  },
+  { flush: "post" },
+);
 
 // openGauss compatibility mode is loaded asynchronously from the backend into a
 // dedicated store map (not the sidebar tree). A restored tab may open before the
@@ -2436,7 +2504,7 @@ async function applyEditorAppearance() {
   syncEditorFontCssVars(liveFontSize.value, ss.fontFamily);
   syncEditorDiagnosticCssVars();
   const themeColors = getCurrentCustomThemeColors();
-  const [themeExt] = await Promise.all([loadEditorTheme(ss.theme, editorThemeAppearance(), themeColors, themePalette.value), ss.vimModeEnabled ? ensureCodeMirrorVim() : Promise.resolve(false)]);
+  const [themeExt, , vimCommands] = await Promise.all([loadEditorTheme(ss.theme, editorThemeAppearance(), themeColors, themePalette.value), ss.vimModeEnabled ? ensureCodeMirrorVim() : Promise.resolve(false), ss.vimModeEnabled ? loadVimConfig() : Promise.resolve([])]);
   if (
     !view.value ||
     !codeMirrorRuntime.codeMirrorTheme ||
@@ -2462,6 +2530,8 @@ async function applyEditorAppearance() {
       codeMirrorRuntime.runKeymapComp.reconfigure(runKeymapExtension(codeMirrorRuntime.editorViewModule.keymap)),
     ],
   });
+  if (ss.vimModeEnabled) applyVimConfigToCurrentEditor(vimCommands);
+  else vimConfigApplied = false;
 }
 
 watch(
@@ -2752,18 +2822,35 @@ defineExpose({
   contain: size layout style;
 }
 
+/* Matches the geometry of the custom-drawn data grid scrollbars (DataGrid.vue):
+   a fixed 10px track with a 4px visual thumb widening on hover/drag, transparent
+   track, capsule thumb, colors from the same --foreground color-mix. The thin
+   idle look comes from a transparent border (background-clip: padding-box);
+   hover drops the border to fill the full track. Partial border widths are not
+   honored on scrollbar part state changes, so the hover endpoint is the full
+   10px track rather than the grid's 6px. Changing the track width on hover
+   would squeeze the content and cause a reflow flicker, so it stays constant. */
 [data-query-editor-root] :deep(.cm-scroller::-webkit-scrollbar) {
-  width: 5px;
-  height: 5px;
+  width: 10px;
+  height: 10px;
 }
 
-[data-query-editor-root] :deep(.cm-scroller::-webkit-scrollbar-track) {
-  background: rgba(127, 127, 127, 0.1);
+[data-query-editor-root] :deep(.cm-scroller::-webkit-scrollbar-track),
+[data-query-editor-root] :deep(.cm-scroller::-webkit-scrollbar-corner) {
+  background: transparent;
 }
 
 [data-query-editor-root] :deep(.cm-scroller::-webkit-scrollbar-thumb) {
-  background: rgba(127, 127, 127, 0.7);
+  background: color-mix(in oklch, var(--foreground) 30%, transparent);
+  background-clip: padding-box;
+  border: 3px solid transparent;
   border-radius: 999px;
+}
+
+[data-query-editor-root] :deep(.cm-scroller::-webkit-scrollbar-thumb:hover),
+[data-query-editor-root] :deep(.cm-scroller::-webkit-scrollbar-thumb:active) {
+  background: color-mix(in oklch, var(--foreground) 48%, transparent);
+  border: 0 solid transparent;
 }
 
 @supports not selector(::-webkit-scrollbar) {

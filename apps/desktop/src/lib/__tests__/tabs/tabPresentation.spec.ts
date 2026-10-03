@@ -21,6 +21,7 @@ import {
   tabDisplayTitles,
   syncTabTitleNumbers,
   tabIconClass,
+  tabModeLabel,
   tabTooltipLines,
   tabularResultItems,
   dirtyTabTitleStyle,
@@ -37,6 +38,7 @@ const translations: Record<string, string> = {
   "tree.events": "Events",
   "connectionGroup.ungroupedLabel": "Ungrouped",
   "editor.noDatabase": "No database",
+  "databaseSearch.title": "Search Database",
 };
 
 const translate = (key: string) => translations[key] ?? key;
@@ -204,7 +206,7 @@ describe("query result labels", () => {
     expect(withoutDatabase?.title).toBe("cosimulation2.0.data_monitor");
   });
 
-  it("keeps a custom result name even when the database is hidden", () => {
+  it("uses a custom result name in comment mode even when the database is hidden", () => {
     const [item] = tabularResultItems(
       [
         {
@@ -213,16 +215,80 @@ describe("query result labels", () => {
           affected_rows: 0,
           execution_time_ms: 1,
           sourceLabel: "My weekly report",
+          sourceLabelKind: "comment",
           sourceQualifier: "app",
           sourceName: "users",
           sourceStatement: "SELECT * FROM users",
         },
       ],
-      { includeSourceDatabase: false },
+      { includeSourceDatabase: false, namingMode: "comment" },
     );
 
     expect(item?.label).toBe("My weekly report");
     expect(item?.title).toBe("My weekly report");
+  });
+
+  it("uses the source table in source mode when a SQL comment also names the result", () => {
+    const [item] = tabularResultItems(
+      [
+        {
+          columns: ["id"],
+          rows: [[1]],
+          affected_rows: 0,
+          execution_time_ms: 1,
+          sourceLabel: "My weekly report",
+          sourceLabelKind: "comment",
+          sourceQualifier: "app",
+          sourceName: "users",
+        },
+      ],
+      { namingMode: "source", preferComments: false },
+    );
+
+    expect(item?.label).toBe("app.users");
+  });
+
+  it.each([
+    ["source", undefined, true, "Weekly report"],
+    ["source", true, false, "Weekly report"],
+    ["source", false, true, "app.users"],
+    ["source", false, false, "users"],
+    ["comment", false, true, "Weekly report"],
+    ["ordinal", true, true, undefined],
+  ] as const)("respects %s naming with preferComments=%s and includeSourceDatabase=%s", (namingMode, preferComments, includeSourceDatabase, expected) => {
+    const result: QueryResult = { columns: ["id"], rows: [[1]], affected_rows: 0, execution_time_ms: 1, sourceLabel: "Weekly report", sourceLabelKind: "comment", sourceQualifier: "app", sourceName: "users" };
+    expect(tabularResultItems([result], { namingMode, preferComments, includeSourceDatabase })[0]?.label).toBe(expected);
+  });
+
+  it("uses the explicit label kind for comment mode and keeps legacy source labels out", () => {
+    const comment = tabularResultItems(
+      [
+        {
+          columns: ["id"],
+          rows: [[1]],
+          affected_rows: 0,
+          execution_time_ms: 1,
+          sourceLabel: "Weekly report",
+          sourceLabelKind: "comment",
+        },
+      ],
+      { namingMode: "comment" },
+    )[0];
+    const legacySource = tabularResultItems(
+      [
+        {
+          columns: ["id"],
+          rows: [[1]],
+          affected_rows: 0,
+          execution_time_ms: 1,
+          sourceLabel: "app.users",
+        },
+      ],
+      { namingMode: "comment" },
+    )[0];
+
+    expect(comment?.label).toBe("Weekly report");
+    expect(legacySource?.label).toBeUndefined();
   });
 });
 
@@ -282,6 +348,34 @@ describe("result run labels", () => {
     const items = resultRunItems(queryTab({ resultRuns: [run("run-1", 1)] }) as QueryTab, { database: "cosimulation2.0", databaseType: "mysql" });
 
     expect(items[0]?.sourceLabel).toBe("cosimulation2.0.users");
+  });
+
+  it("uses explicit comment labels while ignoring legacy source labels in comment mode", () => {
+    const commentRun = run("run-1", 1, { ...sourceResult("Weekly report", "app", "users"), sourceLabelKind: "comment", sourceName: undefined });
+    const legacySourceRun = run("run-2", 2, { ...sourceResult("app.orders", "app", "orders"), sourceLabelKind: undefined });
+
+    expect(resultRunItems(queryTab({ resultRuns: [commentRun, legacySourceRun] }) as QueryTab, { namingMode: "comment" }).map((item) => item.sourceLabel)).toEqual(["Weekly report", undefined]);
+    expect(resultRunItems(queryTab({ resultRuns: [commentRun] }) as QueryTab, { namingMode: "ordinal" })[0]?.sourceLabel).toBeUndefined();
+  });
+
+  it("uses the source table for a commented run in source mode", () => {
+    const commentRun = run("run-1", 1, { ...sourceResult("Weekly report", "app", "users"), sourceLabelKind: "comment" });
+
+    expect(resultRunItems(queryTab({ resultRuns: [commentRun] }) as QueryTab, { namingMode: "source", preferComments: false }).map((item) => item.sourceLabel)).toEqual(["app.users"]);
+  });
+
+  it.each([false, true])("switches comment preference after the run payload is evicted (%s)", (preferComments) => {
+    const commentRun = run("run-1", 1, undefined, { sourceLabel: "Weekly report", sourceLabelKind: "comment", sourceName: "users" });
+    const tab = queryTab({ resultRuns: [commentRun] }) as QueryTab;
+    expect(resultRunItems(tab, { database: "app", databaseType: "mysql", preferComments })[0]?.sourceLabel).toBe(preferComments ? "Weekly report" : "app.users");
+    expect(resultRunItems(tab, { database: "app", databaseType: "mysql", preferComments, includeSourceDatabase: false })[0]?.sourceLabel).toBe(preferComments ? "Weekly report" : "users");
+    expect(resultRunItems(tab, { namingMode: "comment", preferComments })[0]?.sourceLabel).toBe("Weekly report");
+    expect(resultRunItems(tab, { namingMode: "ordinal", preferComments })[0]?.sourceLabel).toBeUndefined();
+  });
+
+  it("prefers comments by default for stored runs without a result payload", () => {
+    const commentRun = run("run-1", 1, undefined, { sourceLabel: "Weekly report", sourceLabelKind: "comment" });
+    expect(resultRunItems(queryTab({ resultRuns: [commentRun] }) as QueryTab)[0]?.sourceLabel).toBe("Weekly report");
   });
 });
 
@@ -380,6 +474,17 @@ describe("tab group presentation", () => {
   it("uses the selected MySQL event name for event editor tabs", () => {
     expect(tabDisplayTitle(queryTab({ mode: "objects", objectBrowser: { objectType: "tables", initialObjectFilter: "events", eventName: "cleanup_sessions" } }), translate)).toBe("cleanup_sessions@db");
     expect(tabDisplayTitle(queryTab({ mode: "objects", objectBrowser: { objectType: "tables", initialObjectFilter: "events" } }), translate)).toBe("Events@db");
+  });
+
+  it("formats database-search tab titles with database and schema scope", () => {
+    expect(tabDisplayTitle(queryTab({ mode: "database-search", database: "shop", schema: "public" }), translate)).toBe("Search Database@shop.public");
+    expect(tabDisplayTitle(queryTab({ mode: "database-search", database: "shop" }), translate)).toBe("Search Database@shop");
+    expect(tabModeLabel(queryTab({ mode: "database-search" }), translate)).toBe("Search Database");
+
+    const settings = useSettingsStore();
+    settings.editorSettings.compactTabTitle = true;
+    expect(tabDisplayTitle(queryTab({ mode: "database-search", database: "shop" }), translate)).toBe("Search Database");
+    settings.editorSettings.compactTabTitle = false;
   });
 
   it("uses the live database and branch context for Dolt version control tabs", () => {
